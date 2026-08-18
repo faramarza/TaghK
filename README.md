@@ -41,7 +41,11 @@ Everything here serves those three.
 | `deploy/control-plane.py` | Plane 3. Pull-only burn detection, nationwide-event guard, automated replacement. |
 | `deploy/bootstrap.sh` | Provisions one transport node — REALITY (Tier D) + CDN-fronted WebSocket (Tier A) + camouflage site + full host hardening. Idempotent. |
 | `deploy/client-singbox.json` | Plane 4. Client template with automatic tier failover. Zero user decisions. |
+| `deploy/durable.js` | Strongly consistent primitives. Token spend records, single-use proof-of-work, probe nonces, rate limiters. These cannot live in KV — see `docs/adr/0001`. |
+| `deploy/canary.js`, `deploy/canary-pool.js` | Canary selection and the generated 246-host bootstrap pool. |
 | `deploy/selftest.mjs` | Cryptographic self-test. **Run before every deployment.** |
+| `deploy/test/` | 135 checks. Both Workers driven through their real APIs in the real Workers runtime, with adversarial cases throughout. |
+| `docs/adr/` | Architecture decision records, including the escalated Cloudflare terms-of-service question. |
 | `deploy/wrangler*.toml`, `package.json` | Deployment config and key generation scripts. |
 
 ---
@@ -62,15 +66,27 @@ infrastructure, cannot be burned by your mistakes, and scales with diaspora part
 rather than with your budget. Getting ten thousand people abroad to run it is worth more
 than everything else here combined.
 
-**2. Verify the cryptography actually works before trusting it:**
+**2. Verify it actually works before trusting it:**
 
 ```bash
-cd deploy && npm install && node selftest.mjs
+cd deploy && npm install
+node selftest.mjs        # cryptography only, two seconds
+./test/run-all.sh        # everything, about two minutes
 ```
+
+`run-all.sh` runs both Workers in the real Workers runtime and drives them
+through the real API — issuance, redemption, concurrency, and the failure paths.
+If your system Python lacks the `cryptography` package, pass an interpreter that
+has one: `PYTHON=/path/to/venv/bin/python ./test/run-all.sh`.
 
 Crypto that does not work is worse than no crypto, because it looks like
 protection. In particular, an unverified DLEQ proof silently forfeits all
 anonymity against the server.
+
+**Read `04-STATUS.md` before assuming any of this is ready.** The backend now
+runs correctly under test; it has never been deployed, there is no client, and
+one open question about Cloudflare's terms of service blocks Tier A
+(`docs/adr/0002`).
 
 **3. Then read `01-ARCHITECTURE.md`, `03-SECURITY.md`, and `02-RUNBOOK.md` §1.**
 

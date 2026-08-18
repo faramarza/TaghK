@@ -20,7 +20,7 @@
  */
 import { unstable_dev } from 'wrangler';
 import { createHash, webcrypto } from 'node:crypto';
-import { rmSync } from 'node:fs';
+import { rmSync, readFileSync } from 'node:fs';
 import { section, check, eq, throws, summary } from './harness.mjs';
 import { blind, unblind, verifyBatch, generateKey } from '../voprf.js';
 
@@ -237,6 +237,20 @@ try {
     const { raw, items } = await getTokens(device, 2).then((r) => r);
     unblind(items, raw.evaluated, { e: raw.proof.e, s: '00'.repeat(32) }, raw.public_key);
   }, 'unblind() throws on a tampered DLEQ proof from the live server');
+
+  section('retention — rate-limit rows must not become a log');
+  {
+    // A SOURCE-LEVEL guard, not a behavioural test, and labelled as one. DO
+    // storage has no TTL, so the prune cadence IS the retention period for a
+    // key containing a peppered hash of a client address. Alarm timing is not
+    // observable from outside the object, so this asserts the constant does not
+    // drift back to the ledger's six hours.
+    const src = readFileSync('durable.js', 'utf8');
+    check(/const RATE_PRUNE_INTERVAL_MS = 120e3;/.test(src),
+      'rate-limit rows are pruned every 120 seconds, matching the old KV TTL');
+    check(/class RateLimiter extends Pruned \{\s*\n\s*get pruneIntervalMs\(\) \{ return RATE_PRUNE_INTERVAL_MS; \}/.test(src),
+      'RateLimiter uses the short cadence rather than inheriting the default');
+  }
 
   section('no data collection');
   const stats = await w.fetch('http://d/admin/stats', { headers: { 'x-admin-key': ADMIN_KEY } });

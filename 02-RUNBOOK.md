@@ -59,7 +59,7 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 133 checks; PYTHON=<venv>/bin/python if your
+./test/run-all.sh          # 135 checks; PYTHON=<venv>/bin/python if your
                            # system python lacks `cryptography`
 ```
 

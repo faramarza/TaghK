@@ -139,6 +139,29 @@ downgrade (§9). **Closed:** `device_pubkey` is required whenever
 malformed request does not cost the user a credential; and `/sub/` now fails
 closed on a lineage with no bound key rather than serving it unauthenticated.
 
+#### 2.12 Rate-limit retention silently extended by the DO migration — *new, closed*
+
+Found by re-reading the P0 diff against I1 rather than by a test, which is the
+only way this class of thing gets found.
+
+A rate-limit key contains a peppered hash of a client address. Under KV it
+carried a 120-second `expirationTtl` and the platform deleted it. Durable Object
+storage has **no TTL**, so the migration quietly made the prune cadence the
+retention period — six hours. IPv4 is small enough to enumerate, so a seizure of
+that storage together with `KEY_SALT` would have recovered which addresses made
+requests during the retained window.
+
+Two minutes of that is abuse control. Six hours of it is a log.
+
+**Closed:** `RateLimiter` prunes on a 120-second cadence, matching the previous
+KV behaviour. The ledger keeps the six-hour cadence, where rows are opaque
+hashes of tokens with no link to any person and the cadence is a cost decision.
+
+*This is the exact shape of the failure mode §9 warns about — a privacy property
+lost as a side effect of a change made for a different reason. It was introduced
+and closed inside one phase; the lesson is that the diff needs reading against
+I1 every time, not that the process worked.*
+
 ### ESCALATED — needs a human decision
 
 #### 2.4 Cloudflare Terms of Service — *researched; decision outstanding*
@@ -262,7 +285,7 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Partly addressed. `deploy/test/` now runs 133 checks across five suites: the
+Partly addressed. `deploy/test/` now runs 135 checks across five suites: the
 cryptographic self-test, a regression harness that models KV's eventual
 consistency, canary pool invariants, and both Workers driven through their real
 APIs in the real Workers runtime with adversarial cases throughout.

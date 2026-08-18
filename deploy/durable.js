@@ -56,9 +56,24 @@ import { DurableObject } from 'cloudflare:workers';
 /** Number of shards. Same key -> same shard, always. */
 export const SHARDS = 4096;
 
-/** How often an object prunes expired rows. Storage is not free and an
- *  unbounded ledger is a cost bug that eventually becomes an outage. */
+/** Default prune cadence. Storage is not free and an unbounded ledger is a cost
+ *  bug that eventually becomes an outage. Ledger rows are opaque hashes of
+ *  tokens with no link to any person, so six hours here is a cost decision. */
 const PRUNE_INTERVAL_MS = 6 * 3600e3;
+
+/**
+ * Rate-limit rows prune far more aggressively, and that is a PRIVACY decision,
+ * not a cost one.
+ *
+ * A rate-limit key contains a peppered hash of a client address. Under KV it
+ * carried a 120-second expirationTtl and the platform deleted it. Durable
+ * Object storage has NO TTL, so moving it here would have quietly extended
+ * retention to whatever the prune cadence happened to be. IPv4 is small enough
+ * to enumerate, so a seizure of this storage together with KEY_SALT would
+ * recover which addresses made requests during the retained window. Two minutes
+ * of that is abuse control. Six hours of it is a log (I1).
+ */
+const RATE_PRUNE_INTERVAL_MS = 120e3;
 
 /**
  * FNV-1a over the key. Not cryptographic and does not need to be: it chooses a
@@ -76,9 +91,12 @@ export function shardOf(key) {
 
 /** Rows are { v: value, e: expiryMillis }. */
 class Pruned extends DurableObject {
+  /** Subclasses override to prune faster. Milliseconds. */
+  get pruneIntervalMs() { return PRUNE_INTERVAL_MS; }
+
   async ensurePrune() {
     if ((await this.ctx.storage.getAlarm()) === null) {
-      await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+      await this.ctx.storage.setAlarm(Date.now() + this.pruneIntervalMs);
     }
   }
 
@@ -90,7 +108,7 @@ class Pruned extends DurableObject {
     // delete() accepts at most 128 keys per call.
     for (let i = 0; i < dead.length; i += 128) await this.ctx.storage.delete(dead.slice(i, i + 128));
     const left = await this.ctx.storage.list({ limit: 1 });
-    if (left.size > 0) await this.ctx.storage.setAlarm(Date.now() + PRUNE_INTERVAL_MS);
+    if (left.size > 0) await this.ctx.storage.setAlarm(Date.now() + this.pruneIntervalMs);
   }
 }
 
@@ -141,6 +159,8 @@ export class Ledger extends Pruned {
  * count and whether it has passed the limit.
  */
 export class RateLimiter extends Pruned {
+  get pruneIntervalMs() { return RATE_PRUNE_INTERVAL_MS; }
+
   async incr(key, limit, windowS) {
     const now = Date.now();
     const row = await this.ctx.storage.get(key);
