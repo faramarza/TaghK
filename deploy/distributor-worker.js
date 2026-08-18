@@ -404,6 +404,16 @@ async function getCredentials(request, env) {
 
   const { token, lineage, lineage_proof, device_pubkey } = body;
 
+  // Device binding was OPTIONAL here while /api/issue required it, so a client
+  // could simply omit device_pubkey and receive a lineage with no bound key —
+  // whose subscription URL is then bearer-only and works for anyone who leaks
+  // or steals it. A security property that switches off when a field is absent
+  // is a silent downgrade, which is exactly what §9 prohibits.
+  //
+  // Checked BEFORE redeem() so a malformed request does not spend a token.
+  if (CFG.REQUIRE_DEVICE_BINDING && (typeof device_pubkey !== 'string' || !device_pubkey))
+    return json({ error: 'invalid' }, 400);
+
   // Anonymous entitlement.
   if (!(await redeem(env, token))) return json({ error: 'invalid' }, 403);
 
@@ -500,7 +510,11 @@ async function subscription(request, env, path) {
   // Device binding: a leaked subscription URL is useless without a fresh
   // signature from the enclave that registered it. The timestamp is signed too,
   // so a captured signature cannot be replayed later.
-  if (CFG.REQUIRE_DEVICE_BINDING && state.device_pubkey) {
+  if (CFG.REQUIRE_DEVICE_BINDING) {
+    // Fail closed on a lineage with no bound key rather than serving it
+    // unauthenticated. Such a lineage cannot be created any more; one that
+    // exists predates the fix and must be re-established, not honoured.
+    if (!state.device_pubkey) return decoy();
     const ts = request.headers.get('x-device-ts');
     const sig = request.headers.get('x-device-sig');
     if (!ts || !sig) return decoy();
@@ -574,8 +588,18 @@ async function subscription(request, env, path) {
 // Operator API
 // ───────────────────────────────────────────────────────────────────────────
 
+/**
+ * Operator API authentication.
+ *
+ * The previous form fell back to a one-character sentinel when ADMIN_KEY was
+ * unset — which meant that on a Worker deployed before its secrets were set,
+ * sending that single character as the header authenticated as the operator.
+ * A misconfiguration must never be an authentication bypass (I5). It now
+ * refuses outright unless a plausible key is actually configured.
+ */
 const authed = (request, env) =>
-  ctEqual(request.headers.get('x-admin-key') || '', env.ADMIN_KEY || ' ');
+  typeof env.ADMIN_KEY === 'string' && env.ADMIN_KEY.length >= 32 &&
+  ctEqual(request.headers.get('x-admin-key') || '', env.ADMIN_KEY);
 
 async function adminNodes(request, env) {
   if (!authed(request, env)) return decoy();

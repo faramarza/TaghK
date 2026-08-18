@@ -1,9 +1,13 @@
 # Build Status and Gap Register
 
-**Honest assessment as of this build. Read before assuming anything works.**
+**Honest assessment. Read before assuming anything works.**
 
-Nothing here has served a real user. One component has been tested. Most has
-never been executed at all.
+Nothing here has served a real user. As of the P0 defect-closure pass, the two
+Workers and the cryptographic core have been executed under test in the real
+Workers runtime; nothing has been deployed to Cloudflare, no node has been
+bootstrapped, and there is still no client.
+
+**Last updated:** P0 defect closure (see `docs/adr/`).
 
 ---
 
@@ -12,68 +16,192 @@ never been executed at all.
 | Component | State | Evidence |
 |---|---|---|
 | `voprf.js` | **Tested** | 12/12 self-test checks pass, including anti-tagging. Found and fixed a real endianness bug. |
-| `probe-agent.py` Ed25519 verify | **Tested** | Validated against the reference `cryptography` implementation, including tamper and wrong-key cases. |
+| `probe-agent.py` Ed25519 verify | **Tested** | Validated against the reference `cryptography` implementation, including tamper and wrong-key cases. Now also verifies a real workerd-produced signature. |
+| `durable.js` | **Tested** | Exercised through both Workers in workerd; exactly-once proven under 32-way concurrency. |
+| `canary.js` / `canary-pool.js` | **Tested** | 29 unit checks plus integration through the collector. |
+| `distributor-worker.js` | **Tested in workerd, never deployed** | 37 checks: full issuance flow, concurrency, rate limits, 14 adversarial cases. Has never run on Cloudflare's edge or handled a real user. |
+| `collector-worker.js` | **Tested in workerd, never deployed** | 37 checks incl. Ed25519 signing, cross-verified by two independent implementations. Never deployed. |
 | `01/02/03` docs | **Complete** | Design work, not code. |
 | `bootstrap.sh` | **Never executed** | Syntax-checked only. Never run on a real VPS. |
-| `distributor-worker.js` | **Never executed** | Syntax-valid. Never deployed, never handled a request. |
-| `collector-worker.js` | **Never executed** | Same. Ed25519 signing support in Workers is *assumed*, not verified. |
 | `control-plane.py` | **Never executed** | Compiles. Never talked to a live endpoint. |
 | `probe-agent.py` (main loop) | **Never executed** | Only the crypto path is tested. |
 | `client-singbox.json` | **Never loaded** | A template. sing-box has never parsed it. |
 
-**Rough completion: architecture ~85%, backend code ~40%, client ~5%,
+**Rough completion: architecture ~85%, backend code ~55%, client ~5%,
 operations ~0%.**
+
+The backend figure moved because the defects that made it unshippable are
+closed and it is now executed rather than assumed. It did not move further
+because "runs correctly in a local runtime" and "serves people in Tehran" are
+separated by a deployment, a fleet, a client, and a probe network.
 
 ---
 
-## 2. Known defects — these are bugs, not gaps
+## 2. Defect register
 
-### 2.1 KV eventual consistency breaks double-spend prevention — **critical**
+Closed defects are kept, not deleted. A register that only lists open items
+loses the record of what was wrong and how it was found.
 
-Cloudflare Workers KV is eventually consistent, with propagation lag up to ~60
-seconds globally. Both of these are read-then-write:
+### CLOSED
 
-```js
-if (await env.ACCOUNTS.get(spentKey)) return false;   // may read stale
-await env.ACCOUNTS.put(spentKey, '1');
-```
+#### 2.1 KV eventual consistency broke double-spend prevention — *was critical*
 
-The same VOPRF token redeemed concurrently in two colos will pass in **both**.
-Same flaw in the collector's token spend check.
+`redeem()` and the collector's token check were read-then-write against
+eventually consistent KV. The same token redeemed concurrently in two colos
+passed in both, multiplying an adversary's credential draw by their number of
+vantage points.
 
-**Impact:** token replay. An adversary can multiply their credential draw by
-firing parallel redemptions from different regions.
+**Closed by** ADR-0001: spend records, PoW single-use, and probe nonces moved to
+Durable Objects. **Evidence:** one token fired from 32 parallel requests is
+accepted exactly once (`test/distributor.test.mjs`); one probe token fired 20
+ways is accepted exactly once (`test/collector.test.mjs`);
+`test/kv-race.test.mjs` asserts the legacy pattern still fails under a model of
+KV's documented behaviour, so the fix cannot silently regress.
 
-**Fix:** move spend records to **Durable Objects** (strongly consistent,
-single-threaded per key), or a strongly-consistent external store. KV is
-appropriate for the node inventory; it is not appropriate for anything requiring
-exactly-once semantics.
+**Residual:** every test request reaches one runtime instance. The single-
+instance-per-ID guarantee is the platform's and is unverified by us until a
+real multi-region deployment in P1.
 
-### 2.2 Rate limiter undercounts under concurrency — **moderate**
+#### 2.2 Rate limiter undercounted under concurrency — *was moderate*
 
-`rateLimited()` is also read-modify-write on KV. Concurrent requests read the
-same counter and each writes `n+1`, so the effective limit is far higher than
-configured. Same fix.
+Same root cause. **Closed by** the same migration. **Evidence:** a 90-request
+burst against a limit of 30 now yields exactly 30 successes; the legacy pattern
+allowed 24 against a limit of 5.
 
-### 2.3 Ed25519 in Workers WebCrypto — **unverified**
+#### 2.3 Ed25519 in Workers WebCrypto — *was unverified*
 
-`crypto.subtle.sign('Ed25519', ...)` is assumed available. If the runtime
-requires `NODE-ED25519` or a compatibility flag, manifest signing fails closed
-and the probe network never starts. Untested.
+`crypto.subtle.sign('Ed25519', …)` was assumed available.
 
-### 2.4 Cloudflare Terms of Service — **possible blocker**
+**Closed for the runtime.** The collector signs a manifest in workerd; the
+signature is verified by the vendored pure-Python code in `probe-agent.py`
+(the code that actually runs on a volunteer's phone) and independently by
+`python-cryptography`. Eight adversarial cases — modified body, substituted
+target host, wrong key, flipped bit, truncated signature, malformed key — are
+all rejected by both.
 
-Running a proxy/tunnel service through Workers and the CDN very likely violates
-Cloudflare's terms. Tier A is the load-bearing whitelist-resistant tier, so this
-is not a footnote. **Unresearched.** Needs a real answer before scaling: a
-commercial agreement, a different provider, or a different Tier A mechanism.
+**Not yet closed for deployment.** workerd is the same runtime binary
+Cloudflare deploys, but this ran locally. The acceptance criterion in the build
+prompt is a *deployed* Worker; that is a P1 item and remains outstanding.
 
-### 2.5 Canary pool is three hardcoded hosts — **moderate**
+#### 2.5 Canary pool was three hardcoded hosts — *was moderate*
 
-`makeCanary()` returns one of three well-known domains. A censor who enrols two
-probes sees the same canaries and identifies the mechanism immediately. Needs a
-large rotating pool, ideally on the same ASNs as real nodes so the two are not
-separable.
+**Closed by** ADR-0003: a generated 246-host pool plus an operator-managed pool
+for ASN-aligned decoys, sampled without replacement. Two behaviours that the
+original design did not have, both found by tests rather than by reasoning, are
+described in that ADR: ASN preference yields below a subpool threshold, and a
+canary down-report only scores when another slot independently reached the same
+host.
+
+#### 2.7 `RATE_LIMIT_PER_MIN` was declared and never enforced — *new, closed*
+
+The collector's config declared a per-minute limit that no code read. A control
+that exists only in a config file is worse than an absent one, because the
+register in 03-SECURITY.md implies it is there.
+
+**Closed:** enforced on `/probe/manifest` and `/probe/report`, keyed on the
+**slot**, never on an address — the people on that endpoint are volunteers
+inside Iran, and the slot is already an opaque pseudonym that identifies nobody
+(I1). Authentication was split from nonce spending so a rate-limited request
+does not destroy a token the volunteer still needs.
+
+#### 2.9 Operator API failed OPEN when `ADMIN_KEY` was unset — *new, closed*
+
+`ctEqual(header, env.ADMIN_KEY || <sentinel>)`. On a Worker deployed before its
+secrets were set, whoever sent exactly the sentinel authenticated as the
+operator.
+
+The sentinel in the shipped source was a NUL byte, which HTTP header values
+cannot carry, so **that exact variant was not reachable over the wire** — the
+severity of the shipped code was lower than the shape suggests. It was one
+careless edit away from being a space, which is reachable, and the code should
+not have been comparing against a sentinel at all. A misconfiguration must
+never be an authentication bypass (I5).
+
+**Closed:** the check now requires a configured key of plausible length and
+refuses otherwise. Tested against empty string, space, tab, and the literal
+`"undefined"`.
+
+*(The NUL byte also made the file register as binary to `grep` and `diff`. For
+a project whose trust model depends on people being able to read the source,
+that is not cosmetic.)*
+
+#### 2.10 Device binding was bypassable by omitting a field — *new, closed*
+
+`/api/issue` required `device_pubkey`. `/api/credentials` treated it as
+optional, and `/sub/` skipped the device check entirely when the lineage had no
+bound key. A client that simply left the field out received a lineage whose
+subscription URL was bearer-only — usable by anyone who leaked or stole it,
+which is precisely what device binding exists to prevent.
+
+A security property that switches off when a field is absent is a silent
+downgrade (§9). **Closed:** `device_pubkey` is required whenever
+`REQUIRE_DEVICE_BINDING` is set, checked *before* the token is spent so a
+malformed request does not cost the user a credential; and `/sub/` now fails
+closed on a lineage with no bound key rather than serving it unauthenticated.
+
+### ESCALATED — needs a human decision
+
+#### 2.4 Cloudflare Terms of Service — *researched; decision outstanding*
+
+**Researched and answered as a question; not decided.** Cloudflare's terms were
+updated on 3 December 2024 to state explicitly that proxy services, such as a
+VPN service, may not run on its network without express approval. Tier A as
+designed is that activity. The distributor and collector are not — they are
+ordinary JSON APIs and no user traffic passes through them.
+
+The sharpest finding is not the prohibition itself: it is that running Tier A on
+the same account as the distribution plane **re-couples the failure domains the
+architecture separated on purpose**, because a terms enforcement action takes
+down both at once, without notice, at peak usage.
+
+Sanctions are not the obstacle — OFAC General License D-2 (31 CFR § 560.540)
+authorises anti-censorship tools for Iran. The blocker is contractual.
+
+**Recommendation and options: `docs/adr/0002-cloudflare-terms-of-service.md`.**
+Requires the project lead, and counsel. Do not proceed with Tier A until
+answered.
+
+### OPEN
+
+#### 2.6 A token can be replayed once its spend record expires — *moderate*
+
+Spend records carry a 30-day TTL (`CFG.SPEND_TTL_S`), inherited from the KV
+implementation. A token held for longer than that and then presented is
+accepted again, because the record proving it was spent has gone.
+
+Not exploitable for the parallel-redemption attack — that is closed — but it is
+a slow replay path with no bound other than patience. Options: bind tokens to a
+key epoch so old tokens become invalid rather than merely unrecorded; retain
+spend records permanently and accept the storage growth; or expire tokens
+themselves at issuance. This wants a decision, not a default. **Do not shorten
+the TTL as a cost saving — that makes the window come sooner.**
+
+#### 2.8 Lost updates remain on lineage state, the reverse index, and inventory
+
+Three read-then-writes on KV were deliberately left alone in the P0 pass because
+moving them is an architecture decision, not a bug fix:
+
+- `lin:<id>` — concurrent updates can lose a suspicion increment
+- `idx:<node>` — a lost update lets a lineage escape attribution entirely
+- `inventory` — concurrent operator writes can clobber each other
+
+None permits a double-spend. All three weaken **attribution**, which is the
+burn-response loop that the rest of the system's safety rests on. Moving
+lineage state to Durable Objects would take the subscription hot path off
+edge-cached storage; that needs its own ADR and the human's sign-off. See
+ADR-0001 "What this does NOT fix".
+
+#### 2.11 Builtin canary reachability from inside Iran is unverified — *blocks P5*
+
+The 246 builtin canary hosts were chosen by judgement, not measurement. If one
+is in fact blocked in country, every honest probe reports it down.
+
+The corroboration rule added in ADR-0003 makes this **harmless rather than
+harmful** — an unreachable canary simply never scores, instead of accusing
+honest volunteers. But the pool still needs empirical validation from the first
+honest probes before their reports are allowed to influence anything, and the
+operator pool needs populating before decoys stop being separable from real
+nodes by address shape. Both are P5 prerequisites and are listed in ADR-0003.
 
 ---
 
@@ -134,9 +262,16 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-No integration tests, no load tests, no chaos testing, no end-to-end run of
-burn → attribution → replacement → client self-heal. The recovery path has never
-been exercised, and an untested recovery path is a broken one.
+Partly addressed. `deploy/test/` now runs 133 checks across five suites: the
+cryptographic self-test, a regression harness that models KV's eventual
+consistency, canary pool invariants, and both Workers driven through their real
+APIs in the real Workers runtime with adversarial cases throughout.
+
+Still absent: load tests, chaos testing, and any end-to-end run of
+burn → attribution → replacement → client self-heal. **The recovery path has
+still never been exercised, and an untested recovery path is a broken one.**
+That loop needs a deployed fleet and a client, so it is gated on P1 and P3
+rather than on more test-writing.
 
 ### 3.8 Operations
 
@@ -152,7 +287,7 @@ Rough, assuming competent people and no surprises.
 
 | Phase | Work | Order of magnitude |
 |---|---|---|
-| **Fix known defects** | Durable Objects migration, verify Ed25519, canary pool, resolve ToS | 1–2 weeks |
+| ~~**Fix known defects**~~ | ~~Durable Objects migration, verify Ed25519, canary pool~~ **done**; ToS researched and escalated, decision outstanding | — |
 | **First real deployment** | Actually run bootstrap, deploy both Workers, one end-to-end path | 1–2 weeks |
 | **Client v1** | Android first, full VOPRF + PoW + enclave + polling, Persian UI | 2–3 months |
 | **Provisioning automation** | Multi-provider Terraform, IPv6 rotation, burn→replace loop | 3–4 weeks |
@@ -178,18 +313,27 @@ The architecture is genuinely usable as a design. Two things are ready today:
    The reasoning is sound even where the code is not finished.
 
 **What you should not do:** deploy this for people inside Iran. The double-spend
-defect is exploitable, the recovery path is untested, there is no client, and
-nobody has audited any of it. Shipping untested circumvention infrastructure to
-users under a hostile government is worse than shipping nothing, because they
-will rely on it.
+defect is now closed, but the recovery path is still untested, there is still no
+client, nothing has run on Cloudflare, and nobody has audited any of it.
+Shipping untested circumvention infrastructure to users under a hostile
+government is worse than shipping nothing, because they will rely on it.
+
+Closing the defects changed one sentence in that paragraph. It did not change
+the paragraph.
 
 ---
 
 ## 6. The honest summary
 
 This is a **well-reasoned architecture with a tested cryptographic core and a
-set of reference implementations that have mostly never run.**
+backend that now runs correctly under test but has never been deployed.**
 
 That is a real artifact and a useful one. It is not a system. The distance
 between the two is mostly the client application, operational maturity, and
 trust infrastructure — and that distance is measured in months, not days.
+
+What changed in the P0 pass is that the backend is no longer *assumed* to work.
+Four defects are closed with executed evidence, one is escalated with research
+behind it, and five more were found — three of them fixed, two recorded open
+rather than quietly patched outside the phase's scope. What has not changed is
+that no user can reach any of it.

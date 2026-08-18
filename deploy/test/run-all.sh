@@ -22,10 +22,10 @@ echo; echo "═══ 3/5  canary pool invariants (04-STATUS 2.5)"
 node test/canary.test.mjs
 
 echo; echo "═══ 4/5  distributor in workerd — exactly-once, rate limits, adversarial"
-node test/distributor.test.mjs 2>&1 | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
+node test/distributor.test.mjs 2>&1 | tr -d "\000" | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
 
 echo; echo "═══ 5/5  collector in workerd + independent Ed25519 verification (04-STATUS 2.3)"
-node test/collector.test.mjs 2>&1 | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
+node test/collector.test.mjs 2>&1 | tr -d "\000" | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
 "$PYTHON" test/verify-manifest.py
 
 echo; echo "═══ all suites passed"

@@ -15,7 +15,8 @@
 | Total blackout | §4.5 |
 | Suspected honeypot clone of your app | §4.6 |
 | Weekly / monthly maintenance | §5 |
-| Something feels wrong and you can't tell what | §6 |
+| Setting up canaries before enrolling probes | §6 |
+| Something feels wrong and you can't tell what | §7 |
 
 ---
 
@@ -44,24 +45,61 @@ than anything else in this document.
 Build this first. Without it you are hand-delivering configs forever, and the system
 cannot exceed the number of people you can personally message.
 
+> **Account separation — read `docs/adr/0002-cloudflare-terms-of-service.md` first.**
+> Cloudflare's terms prohibit running proxy services on its network without
+> express approval. The distributor and collector are ordinary JSON APIs and are
+> not that; **Tier A is.** Use a Cloudflare account for the distribution and
+> measurement planes that never carries tunnelled traffic. If Tier A runs on
+> Cloudflare at all, it goes on a different account. Sharing one account means a
+> single terms enforcement action takes down both the transport and the
+> subscription URL that was supposed to survive it.
+
+**Run the test suite before you deploy anything.** It takes about two minutes
+and it is the difference between "syntax-valid" and "works".
+
 ```bash
-npm install -g wrangler
+cd deploy && npm install
+./test/run-all.sh          # 133 checks; PYTHON=<venv>/bin/python if your
+                           # system python lacks `cryptography`
+```
+
+```bash
+npm install -g wrangler    # wrangler 4 or later — v3 ships known advisories
 wrangler login
 
 wrangler kv namespace create ACCOUNTS
 wrangler kv namespace create NODES
 # paste the returned IDs into wrangler.toml
 
+# Durable Objects need no pre-creation: the [[migrations]] block in
+# wrangler.toml creates the Ledger and RateLimiter classes on first deploy.
+# They hold token spend records and rate limiters, which CANNOT live in KV —
+# see docs/adr/0001-durable-objects-for-exactly-once.md.
+
 wrangler secret put ADMIN_KEY        # generate: openssl rand -hex 32
+wrangler secret put KEY_SALT         # openssl rand -hex 32 — NEVER ROTATE,
+                                     # and it MUST DIFFER from ADMIN_KEY
+wrangler secret put VOPRF_SK         # npm run keygen:voprf
 wrangler deploy
 ```
+
+**All three secrets are required.** The Worker refuses the operator API
+outright when `ADMIN_KEY` is absent rather than falling back to anything, so a
+half-configured deployment fails closed and looks like a 404. That is intended;
+if `/admin/stats` returns the decoy with a key you believe is right, check the
+secret is actually set before debugging anything else.
 
 Verify it is alive and that unknown paths look boring:
 
 ```bash
 curl -s https://dist.<you>.workers.dev/api/challenge | jq
 curl -s -o /dev/null -w '%{http_code}\n' https://dist.<you>.workers.dev/     # expect 404 decoy
+curl -s -H "x-admin-key: $ADMIN_KEY" https://dist.<you>.workers.dev/admin/stats | jq
 ```
+
+The challenge is a self-contained MAC-bound string of the form
+`p1.<random>.<bits>.<expiry>.<mac>` — nothing is written at issuance, so a
+challenge that never gets solved costs storage nothing.
 
 ### Stage 3 — First transport node
 
@@ -285,7 +323,60 @@ the state than any amount of DPI.
 
 ---
 
-## 6. Debugging checklist
+## 6. Canary pool — do this before enrolling any probe
+
+Manifests carry decoy targets so a probe that lies about them identifies
+itself. Out of the box the collector uses a 246-host builtin pool, which works
+but is **separable from real nodes by shape**: real Tier-D targets are IPs on
+VPS ASNs, builtin canaries are third-party domains on academic and CDN ASNs. A
+careful adversary can tell them apart. `/admin/verdicts` warns while this is
+true — check `canary_pool.warnings` in its output.
+
+The fix is decoy hosts you run yourself, on the same providers as the real
+fleet, serving an ordinary website and no proxy:
+
+```bash
+# Stand up ordinary web servers on the SAME providers as your real nodes.
+# They must be real, reachable, and boring. They are not proxies and must
+# never become proxies.
+
+curl -X POST https://collect.<you>.workers.dev/admin/canary-pool \
+  -H "x-admin-key: $COLLECTOR_ADMIN" -H 'content-type: application/json' \
+  -d '[{"host":"a.decoy.example","port":443,"asn_group":"prov-a"},
+       {"host":"b.decoy.example","port":443,"asn_group":"prov-a"}]'
+
+# Tag the real targets with the matching asn_group so canaries are drawn from
+# the same ASNs:
+curl -X POST https://collect.<you>.workers.dev/admin/targets \
+  -H "x-admin-key: $COLLECTOR_ADMIN" -H 'content-type: application/json' \
+  -d '[{"ref":"n-aaa","node_id":"...","host":"203.0.113.10","asn_group":"prov-a"}]'
+
+# Check it took:
+curl -s -H "x-admin-key: $COLLECTOR_ADMIN" \
+  https://collect.<you>.workers.dev/admin/canary-pool | jq .health
+```
+
+**At least 24 aligned entries are needed before alignment turns on.** Below
+that the collector deliberately ignores `asn_group` and draws from the whole
+pool, because drawing repeatedly from a handful of hosts identifies them — which
+is the original defect wearing a better hat. `health.warnings` says so
+explicitly when you are under the threshold.
+
+**A canary down-report only counts against a slot once another slot has
+independently reached the same host.** This means detection is slower and it
+means an honest volunteer whose network cannot reach some canary is never
+accused for it. That trade is deliberate: under this government a false
+positive is a real person losing access.
+
+Regenerating the builtin pool as hosts die:
+
+```bash
+cd deploy && npm run build:canary-pool && npm run test:canary
+```
+
+---
+
+## 7. Debugging checklist
 
 When something is wrong and you cannot tell what, work down this list in order.
 
@@ -302,12 +393,24 @@ When something is wrong and you cannot tell what, work down this list in order.
 10. Is the client's clock right?   TLS fails silently on clock skew. Checked last, breaks first.
 ```
 
+Two failure modes that now look like a 404 rather than an error, because
+everything does:
+
+- **`/admin/*` returns the decoy with a key you believe is correct.** The secret
+  is probably not set on the Worker. Auth refuses outright when `ADMIN_KEY` is
+  missing instead of falling back to anything.
+- **`/sub/<lineage>` returns the decoy for a client that used to work.** The
+  device signature is missing, stale (outside the ±5 minute skew), or the
+  lineage was created without a bound device key. The last case cannot happen
+  any more but pre-existing lineages are refused rather than served
+  unauthenticated — those clients must re-establish.
+
 **Step 7 is the one that matters.** Steps 1–6 can all pass on a node that is completely
 blocked inside Iran.
 
 ---
 
-## 7. Operator security
+## 8. Operator security
 
 **Legal position:** in the US, EU, and Canada this is lawful. OFAC **General License D-2**
 explicitly authorises exporting personal communications services and
@@ -331,7 +434,7 @@ acquaintance's real account.
 
 ---
 
-## 8. Metrics that matter
+## 9. Metrics that matter
 
 Track these. Ignore vanity numbers.
 

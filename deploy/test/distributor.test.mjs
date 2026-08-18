@@ -216,6 +216,8 @@ try {
   }
 
   eq((await post('/admin/nodes', [{ id: 'x' }])).status, 404, 'admin API without a key returns the decoy');
+  eq((await post('/api/credentials', { token: { t: 'a'.repeat(64), w: 'b'.repeat(64) } })).status, 400,
+    'credentials without a device public key are refused, not silently unbound');
   eq((await post('/admin/nodes', [{ id: 'x' }], { 'x-admin-key': 'wrong' })).status, 404,
     'admin API with a wrong key returns the decoy');
   eq((await post('/api/issue', '{not json')).status, 404, 'malformed JSON returns the decoy');
@@ -242,6 +244,34 @@ try {
   check(!JSON.stringify(statsJson).match(/ip|user|geo|device|country/i),
     'operator stats expose no user, address, device, or geography field',
     JSON.stringify(statsJson).slice(0, 90));
+  section('fail closed on misconfiguration');
+  {
+    // A Worker deployed before its secrets are set must refuse the operator
+    // API, not accept a one-character sentinel as the key.
+    const unconfigured = await unstable_dev('distributor-worker.js', {
+      config: 'wrangler.toml', local: true, persistTo: `${PERSIST}-nokey`,
+      vars: { KEY_SALT: 'b2'.repeat(32), VOPRF_SK: voprfKey.secret },
+      experimental: { disableExperimentalWarning: true },
+    });
+    try {
+      // The old code compared against `env.ADMIN_KEY || <sentinel>`, so on an
+      // unconfigured Worker whoever sent exactly the sentinel authenticated as
+      // the operator. The sentinel in the shipped source happened to be a NUL
+      // byte, which HTTP header values cannot carry — so that exact variant was
+      // not reachable over the wire. It was one careless edit away from being a
+      // space, which is, and the code should not be comparing against a
+      // sentinel in the first place. These are the reachable variants.
+      const attempts = [['empty string', ''], ['a single space', ' '],
+                        ['a tab', '\t'], ['the string "undefined"', 'undefined']];
+      for (const [label, attempt] of attempts) {
+        eq((await unconfigured.fetch('http://d/admin/stats', { headers: { 'x-admin-key': attempt } })).status,
+          404, `unset ADMIN_KEY refuses ${label} as a key`);
+      }
+    } finally {
+      await unconfigured.stop();
+      rmSync(`${PERSIST}-nokey`, { recursive: true, force: true });
+    }
+  }
 } finally {
   await w.stop();
   rmSync(PERSIST, { recursive: true, force: true });
