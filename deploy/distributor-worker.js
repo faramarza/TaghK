@@ -63,9 +63,21 @@
  *  crowd, while revealing nothing about the hardware. Binding a credential to
  *  hardware is safe. Identifying the hardware is not.
  *
+ * STORAGE SPLIT — read this before moving anything between the two.
+ *
+ *   KV is EVENTUALLY CONSISTENT. A read may be up to ~60s stale and colos read
+ *   independently. That is fine for read-mostly inventory on the hot path and
+ *   fatal for anything that must happen at most once. Token spend records, PoW
+ *   single-use, and rate limiters therefore live in Durable Objects
+ *   (durable.js), where the same key is served by exactly one instance
+ *   world-wide and read-modify-write is atomic. See 04-STATUS.md defects 2.1
+ *   and 2.2 and docs/adr/0001-durable-objects-for-exactly-once.md.
+ *
  * Bindings:
- *   KV      ACCOUNTS   lineage state, PoW challenges, spent tokens, rate limits
- *   KV      NODES      inventory, reverse index, fallbacks
+ *   KV      ACCOUNTS      lineage state
+ *   KV      NODES         inventory, reverse index, fallbacks
+ *   DO      LEDGER        spent tokens, single-use PoW  — STRONGLY CONSISTENT
+ *   DO      RATE_LIMITER  request counters              — STRONGLY CONSISTENT
  *   Secret  ADMIN_KEY  operator API auth
  *   Secret  KEY_SALT   hashing pepper — SEPARATE from ADMIN_KEY so that
  *                      rotating the admin key does not invalidate every hash
@@ -73,6 +85,10 @@
  */
 
 import { issue, verifyToken as voprfVerify, spendKey, timingSafeEqual } from './voprf.js';
+import { claimOnce, overLimit } from './durable.js';
+
+// Durable Object classes must be exported from the Worker entry point.
+export { Ledger, RateLimiter } from './durable.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -99,6 +115,11 @@ const CFG = {
   RATE_WINDOW_S: 60,
   RATE_MAX_CHALLENGE: 30,
   RATE_MAX_ISSUE: 10,
+
+  // How long a spend record is retained. A token presented after this window
+  // would be accepted again — see 04-STATUS.md defect 2.6. Do not shorten it
+  // without reading that entry first.
+  SPEND_TTL_S: 30 * 86400,
 
   MAX_BODY_BYTES: 64 * 1024,
 };
@@ -188,33 +209,63 @@ function b64utf8(str) {
 
 /**
  * Coarse rate limiting keyed on a HASHED client hint.
+ *
  * The hint is never stored in the clear and expires within the minute, so no
  * durable record of any address exists. This is abuse control, not logging.
+ *
+ * Counted in a Durable Object, not KV. The KV version was read-modify-write:
+ * concurrent requests all read the same counter and all wrote n+1, so the
+ * effective limit was roughly (configured limit x concurrency) and the control
+ * did nothing under exactly the load it exists to handle (04-STATUS.md 2.2).
+ *
+ * Fails CLOSED — if the counter is unreachable the request is limited. An
+ * outage must not open an unmetered harvesting window.
  */
 async function rateLimited(request, env, bucket, max) {
   const hint = request.headers.get('cf-connecting-ip') || 'unknown';
   const window = Math.floor(Date.now() / 1000 / CFG.RATE_WINDOW_S);
   const key = `rl:${bucket}:${window}:${await peppered(env, 'rl', hint)}`;
-  const n = Number((await env.ACCOUNTS.get(key)) || 0) + 1;
-  await env.ACCOUNTS.put(key, String(n), { expirationTtl: CFG.RATE_WINDOW_S * 2 });
-  return n > max;
+  return overLimit(env.RATE_LIMITER, key, max, CFG.RATE_WINDOW_S);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
 // Proof of work — economic Sybil resistance, no identity required
 // ───────────────────────────────────────────────────────────────────────────
 
+/**
+ * Challenges are STATELESS: the difficulty and expiry travel inside the
+ * challenge and are bound by an HMAC under KEY_SALT, so a client cannot lower
+ * its own difficulty or extend its own deadline.
+ *
+ * The previous design wrote `pow:<challenge>` to KV at issuance and deleted it
+ * at redemption. That was wrong twice over. The delete was a read-then-write on
+ * eventually consistent storage, so one solved challenge could be spent
+ * concurrently in several colos; and the write itself was an unauthenticated
+ * storage primitive an attacker could hammer for free. Nothing is written at
+ * issuance now, and the single-use record is claimed in a Durable Object.
+ *
+ *   challenge = p1.<random>.<bits>.<expiry>.<mac>
+ */
+const POW_VERSION = 'p1';
+const POW_RE = /^p1\.[0-9a-f]{48}\.\d{1,3}\.\d{1,12}\.[0-9a-f]{32}$/;
+
+async function powMac(env, payload) {
+  const key = await crypto.subtle.importKey(
+    'raw', enc.encode(`${env.KEY_SALT}:pow`), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  return toHex(await crypto.subtle.sign('HMAC', key, enc.encode(payload))).slice(0, 32);
+}
+
 async function getChallenge(request, env) {
   if (await rateLimited(request, env, 'chal', CFG.RATE_MAX_CHALLENGE)) return decoy();
 
   const renew = new URL(request.url).searchParams.get('renew') === '1';
-  const challenge = randHex(24);
   const bits = renew ? CFG.POW_BITS_RENEW : CFG.POW_BITS_NEW;
-
-  await env.ACCOUNTS.put(`pow:${challenge}`, String(bits), { expirationTtl: CFG.POW_TTL_S });
+  const expiry = Math.floor(Date.now() / 1000) + CFG.POW_TTL_S;
+  const payload = `${POW_VERSION}.${randHex(24)}.${bits}.${expiry}`;
 
   return json({
-    challenge,
+    challenge: `${payload}.${await powMac(env, payload)}`,
     bits,
     algorithm: 'sha256-leading-zero-bits',
     expires_in: CFG.POW_TTL_S,
@@ -222,12 +273,19 @@ async function getChallenge(request, env) {
 }
 
 async function consumePow(env, challenge, nonce) {
-  if (typeof challenge !== 'string' || !/^[0-9a-f]{48}$/.test(challenge)) return false;
-  if (typeof nonce !== 'string' || nonce.length > 64) return false;
+  if (typeof challenge !== 'string' || !POW_RE.test(challenge)) return false;
+  if (typeof nonce !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(nonce)) return false;
 
-  const raw = await env.ACCOUNTS.get(`pow:${challenge}`);
-  if (!raw) return false;
-  const bits = Number(raw);
+  const parts = challenge.split('.');
+  const mac = parts.pop();
+  if (!ctEqual(await powMac(env, parts.join('.')), mac)) return false;
+
+  const bits = Number(parts[2]);
+  const expiry = Number(parts[3]);
+  // The MAC already binds both, so these are defence in depth against a future
+  // edit that lets an operator configure a nonsensical difficulty.
+  if (!(bits >= CFG.POW_BITS_RENEW && bits <= 32)) return false;
+  if (Math.floor(Date.now() / 1000) > expiry) return false;
 
   const digest = new Uint8Array(
     await crypto.subtle.digest('SHA-256', enc.encode(challenge + nonce))
@@ -240,8 +298,10 @@ async function consumePow(env, challenge, nonce) {
   }
   if (zeros < bits) return false;
 
-  await env.ACCOUNTS.delete(`pow:${challenge}`);   // single use; no replay
-  return true;
+  // Single use. Strongly consistent, so parallel submissions of one solved
+  // challenge yield exactly one success. Claimed only after the work checks
+  // out, so a wrong nonce cannot burn someone else's challenge.
+  return claimOnce(env.LEDGER, `pow:${parts[1]}`, CFG.POW_TTL_S + 60);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -324,10 +384,12 @@ async function redeem(env, token) {
 
   // Double-spend check. The stored key is a peppered hash, so the spend log
   // reveals nothing about tokens that have not yet been presented.
-  const key = `spent:${spendKey(token.t, env.KEY_SALT)}`;
-  if (await env.ACCOUNTS.get(key)) return false;
-  await env.ACCOUNTS.put(key, '1', { expirationTtl: 30 * 86400 });
-  return true;
+  //
+  // claimOnce() is a Durable Object insert-if-absent, NOT a KV read-then-write.
+  // The KV version returned true in every colo that read the record before it
+  // propagated, which let an adversary multiply their credential draw by their
+  // number of vantage points — unbounded for a state actor. See 04-STATUS 2.1.
+  return claimOnce(env.LEDGER, `spent:${spendKey(token.t, env.KEY_SALT)}`, CFG.SPEND_TTL_S);
 }
 
 // ───────────────────────────────────────────────────────────────────────────

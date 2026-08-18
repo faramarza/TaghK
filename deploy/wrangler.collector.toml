@@ -23,5 +23,22 @@ id = "REPLACE_MEASUREMENTS_ID"
 #   COLLECTOR_ADMIN  openssl rand -hex 32      MUST DIFFER from ADMIN_KEY
 #   ENROL_SALT       openssl rand -hex 32      never rotate
 
+# ── Strongly consistent storage (04-STATUS.md defects 2.1 / 2.2) ───────────
+# Spend records and rate limiters CANNOT live in KV: a read-then-write against
+# eventually consistent storage is not exactly-once, and both were.
+# See docs/adr/0001-durable-objects-for-exactly-once.md.
+
+[[durable_objects.bindings]]
+name = "LEDGER"
+class_name = "Ledger"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Ledger", "RateLimiter"]
+
 [observability]
 enabled = false               # no logs, architecturally — not as policy

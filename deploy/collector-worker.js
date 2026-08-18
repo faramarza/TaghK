@@ -49,13 +49,26 @@
  *  can do group arithmetic, move it to VOPRF.
  *
  * Bindings:
- *   KV      PROBES         slot reputation, canary state, spent nonces
- *   KV      MEASUREMENTS   aggregated per-node verdicts
+ *   KV      PROBES         slot reputation, canary issuance records
+ *   KV      MEASUREMENTS   targets, canary pool, aggregated per-node verdicts
+ *   DO      LEDGER         spent probe nonces  — STRONGLY CONSISTENT
+ *   DO      RATE_LIMITER   per-slot counters   — STRONGLY CONSISTENT
  *   Secret  PROBE_HMAC_KEY   token authentication key
  *   Secret  MANIFEST_SK      Ed25519 private key (PKCS#8, base64) for signing
  *   Secret  COLLECTOR_ADMIN  operator API key
  *   Secret  ENROL_SALT       one-time enrolment code derivation
+ *
+ * Nonce spend records moved off KV for the same reason as the distributor's
+ * token spend records: a KV read-then-write is not exactly-once, and a probe
+ * token replayed from two vantage points passed both checks. See
+ * 04-STATUS.md 2.1 and docs/adr/0001-durable-objects-for-exactly-once.md.
  */
+
+import { claimOnce, overLimit } from './durable.js';
+import { effectivePool, chooseCanaries, poolHealth, normaliseOperatorEntry } from './canary.js';
+
+// Durable Object classes must be exported from the Worker entry point.
+export { Ledger, RateLimiter } from './durable.js';
 
 const CFG = {
   TOKENS_PER_ENROL: 96,
@@ -73,6 +86,7 @@ const CFG = {
 
   SLOT_SUSPICION_THRESHOLD: 2.0,
   RATE_LIMIT_PER_MIN: 20,
+  NONCE_TTL_S: 7 * 86400,
 };
 
 export default {
@@ -85,6 +99,7 @@ export default {
         case '/probe/report':   return await report(request, env);
         case '/admin/verdicts': return await verdicts(request, env);
         case '/admin/targets':  return await setTargets(request, env);
+        case '/admin/canary-pool': return await canaryPool(request, env);
         case '/admin/enrol-codes': return await mintCodes(request, env);
         default:                return decoy();
       }
@@ -150,20 +165,46 @@ async function mintToken(env, slot) {
   return { slot, nonce, mac: await hmac(env, `${slot}:${nonce}`) };
 }
 
-async function verifyToken(env, token) {
+/**
+ * Authentication only — verifies the MAC and returns the slot. Deliberately
+ * STATELESS and side-effect free so the caller can rate-limit on the slot
+ * BEFORE spending the nonce. Spending first would mean a rate-limited request
+ * had already destroyed a token the volunteer needs.
+ */
+async function authSlot(env, token) {
   if (!token?.slot || !token?.nonce || !token?.mac) return null;
   if (!/^[0-9a-f]{1,32}$/.test(token.slot) || !/^[0-9a-f]{32}$/.test(token.nonce)) return null;
-
   const expected = await hmac(env, `${token.slot}:${token.nonce}`);
-  if (!ctEqual(expected, token.mac)) return null;
+  return ctEqual(expected, token.mac) ? token.slot : null;
+}
 
-  // Single use. The spent record is a hash — the token itself is never stored,
-  // so the spend log reveals nothing about tokens not yet presented.
-  const spentKey = `spent:${(await hmac(env, `spend:${token.nonce}`)).slice(0, 32)}`;
-  if (await env.PROBES.get(spentKey)) return null;
-  await env.PROBES.put(spentKey, '1', { expirationTtl: 7 * 86400 });
+/**
+ * Single use. Strongly consistent — the KV version was a read-then-write, so
+ * one probe token replayed from two vantage points was accepted twice.
+ *
+ * The spent record is a hash of the nonce, so the ledger reveals nothing about
+ * tokens not yet presented and nothing at all about who holds them.
+ */
+async function spendNonce(env, token) {
+  const key = `spent:${(await hmac(env, `spend:${token.nonce}`)).slice(0, 32)}`;
+  return claimOnce(env.LEDGER, key, CFG.NONCE_TTL_S);
+}
 
-  return token.slot;
+/**
+ * Rate limiting is keyed on the SLOT, never on an address.
+ *
+ * The obvious implementation hashes cf-connecting-ip like the distributor does.
+ * We do not, because the people on this endpoint are volunteers running
+ * measurement infrastructure inside a hostile state, the slot is already an
+ * opaque pseudonym that identifies nobody, and it is a tighter limit anyway.
+ * Do not "improve" this by adding an address (I1).
+ *
+ * CFG.RATE_LIMIT_PER_MIN was declared and never enforced before this — a
+ * control that existed only in the config file. See 04-STATUS.md 2.7.
+ */
+async function slotLimited(env, bucket, slot) {
+  const window = Math.floor(Date.now() / 1000 / 60);
+  return overLimit(env.RATE_LIMITER, `rl:${bucket}:${window}:${slot}`, CFG.RATE_LIMIT_PER_MIN, 60);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -224,8 +265,10 @@ async function manifest(request, env) {
   if (request.method !== 'POST') return decoy();
   const { token } = await request.json().catch(() => ({}));
 
-  const slot = await verifyToken(env, token);
+  const slot = await authSlot(env, token);
   if (!slot) return decoy();
+  if (await slotLimited(env, 'manifest', slot)) return decoy();
+  if (!(await spendNonce(env, token))) return decoy();
 
   const state = JSON.parse((await env.PROBES.get(`slot:${slot}`)) || 'null');
   if (!state) return decoy();
@@ -250,9 +293,16 @@ async function manifest(request, env) {
 
   // Canaries: real, reachable, unremarkable hosts that are NOT our nodes.
   // Unique per issuance, so a canary that dies points at exactly one slot.
+  //
+  // Drawn WITHOUT REPLACEMENT from a pool of at least 200 hosts, preferring
+  // hosts on the same ASNs as the real targets in this same manifest. The old
+  // three-host hardcoded pool was identifiable by enrolling twice
+  // (04-STATUS.md 2.5). See canary.js and canary-pool.js.
+  const pool = effectivePool(JSON.parse((await env.MEASUREMENTS.get('canary_pool')) || 'null'));
+  const canaries = chooseCanaries(pool, nDecoy, chosen.map((t) => t.asn_group));
+
   const canaryRefs = [];
-  for (let i = 0; i < nDecoy; i++) {
-    const c = makeCanary();
+  for (const c of canaries) {
     const ref = `c-${randHex(6)}`;
     canaryRefs.push(ref);
     entries.push({ ref, host: c.host, port: c.port, sni: c.sni, kind: 'node' });
@@ -282,34 +332,41 @@ async function manifest(request, env) {
   return json({ manifest: body, signature, tokens });
 }
 
-/**
- * Canary hosts. Must be real, reachable, and boring — a decoy that is already
- * unreachable teaches nothing, and one that looks like infrastructure teaches
- * the adversary what to look for.
- *
- * In production draw these from a large rotating pool of innocuous public
- * endpoints, ideally on the same providers as real nodes so the two are not
- * separable by ASN.
- */
-function makeCanary() {
-  const pool = [
-    { host: 'example.com', port: 443, sni: 'example.com' },
-    { host: 'www.iana.org', port: 443, sni: 'www.iana.org' },
-    { host: 'neverssl.com', port: 80, sni: null },
-  ];
-  return pool[secureInt(pool.length)];
-}
-
 // ───────────────────────────────────────────────────────────────────────────
 // Reports
 // ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Record one slot's observation of a canary HOST (not the per-slot ref) and
+ * report whether some OTHER slot reached that same host in this window.
+ *
+ * The aggregate is keyed on a MAC of the hostname, never the hostname itself.
+ * A seized MEASUREMENTS namespace must not hand the adversary the canary pool —
+ * knowing which hosts are decoys is precisely what lets them answer truthfully
+ * about decoys and falsely about real nodes.
+ *
+ * KV is the right store here: this is an aggregate, staleness only delays a
+ * verdict, and a stale read can only under-credit suspicion (see report()).
+ */
+async function recordCanaryObservation(env, host, slot, up, window) {
+  const key = `cm:${window}:${(await hmac(env, `canary-host:${host}`)).slice(0, 24)}`;
+  const agg = JSON.parse((await env.MEASUREMENTS.get(key)) || '{"up":[],"down":[]}');
+  const bucket = up ? agg.up : agg.down;
+  if (!bucket.includes(slot)) bucket.push(slot);
+  agg.up = agg.up.slice(-256);        // bounded: one vote per slot, capped
+  agg.down = agg.down.slice(-256);
+  await env.MEASUREMENTS.put(key, JSON.stringify(agg), { expirationTtl: 7 * 86400 });
+  return agg.up.some((s) => s !== slot);
+}
 
 async function report(request, env) {
   if (request.method !== 'POST') return decoy();
   const body = await request.json().catch(() => ({}));
 
-  const slot = await verifyToken(env, body.token);
+  const slot = await authSlot(env, body.token);
   if (!slot) return decoy();
+  if (await slotLimited(env, 'report', slot)) return decoy();
+  if (!(await spendNonce(env, body.token))) return decoy();
 
   const results = Array.isArray(body.results)
     ? body.results.slice(0, CFG.MAX_RESULTS_PER_REPORT)
@@ -327,10 +384,20 @@ async function report(request, env) {
     // Canary handling — the hostile-probe detector.
     const canary = JSON.parse((await env.PROBES.get(`canary:${r.ref}`)) || 'null');
     if (canary) {
-      // A canary is a well-known public host. If a slot reports it unreachable
-      // while other slots reach it fine, that slot is lying — the signature of a
-      // censor feeding false blocks to burn healthy nodes.
-      if (r.tcp === false) {
+      // A down-report on a canary scores ONLY when another slot independently
+      // reached the same host in the same window.
+      //
+      // Without that condition the detector runs backwards. Whether a given
+      // canary host is reachable from inside Iran is a judgement, not a
+      // measurement; if one of them is in fact blocked in country, every HONEST
+      // probe reports it down and gets accused, while the censor — who knows
+      // which hosts are blocked — reports it up and looks clean.
+      //
+      // The corroboration read is from KV and may be stale, which can only
+      // UNDER-credit suspicion. That is the correct direction to fail: a false
+      // positive here is a real person quietly losing the good nodes (I3).
+      const corroborated = await recordCanaryObservation(env, canary.host, slot, r.tcp === true, window);
+      if (r.tcp === false && corroborated) {
         state.suspicion = (state.suspicion || 0) + 1.0;
       }
       continue;                       // canary results never touch node verdicts
@@ -367,10 +434,38 @@ async function setTargets(request, env) {
     host: t.host,
     port: t.port || 443,
     sni: t.sni || null,
+    // Operator-side only, never sent to probes. Used to draw canaries from the
+    // same ASNs as the real targets in a manifest so the two are not separable.
+    asn_group: typeof t.asn_group === 'string' ? t.asn_group.slice(0, 64) : null,
     status: t.status || 'active',
   }));
   await env.MEASUREMENTS.put('targets', JSON.stringify(list));
   return json({ ok: true, count: list.length });
+}
+
+/**
+ * Operator-managed canary pool.
+ *
+ * This is where ASN-aligned decoys go — hosts on the SAME providers as the real
+ * fleet, serving an ordinary site and no proxy. Until this is populated the
+ * builtin bootstrap pool is in use and decoys are separable from real nodes by
+ * address shape; poolHealth() says so rather than letting an operator assume
+ * otherwise. See canary-pool.js and 02-RUNBOOK.md §6.
+ */
+async function canaryPool(request, env) {
+  if (!ctEqual(request.headers.get('x-admin-key') || '', env.COLLECTOR_ADMIN)) return decoy();
+
+  if (request.method === 'GET') {
+    const raw = JSON.parse((await env.MEASUREMENTS.get('canary_pool')) || 'null');
+    return json({ operator: Array.isArray(raw) ? raw : [], health: poolHealth(effectivePool(raw)) });
+  }
+
+  const incoming = await request.json().catch(() => null);
+  if (!Array.isArray(incoming)) return decoy();
+  const clean = incoming.slice(0, 2048).map(normaliseOperatorEntry).filter(Boolean);
+  await env.MEASUREMENTS.put('canary_pool', JSON.stringify(clean));
+  return json({ ok: true, accepted: clean.length, rejected: incoming.length - clean.length,
+                health: poolHealth(effectivePool(clean)) });
 }
 
 /**
@@ -418,7 +513,16 @@ async function verdicts(request, env) {
     });
   }
 
-  return json({ generated_at: Date.now(), quorum: CFG.QUORUM, verdicts: out });
+  // Surfaced so an operator cannot unknowingly run a probe network whose
+  // decoys an adversary can separate from real nodes. Counts only, no user data.
+  const pool = effectivePool(JSON.parse((await env.MEASUREMENTS.get('canary_pool')) || 'null'));
+
+  return json({
+    generated_at: Date.now(),
+    quorum: CFG.QUORUM,
+    canary_pool: poolHealth(pool),
+    verdicts: out,
+  });
 }
 
 // ───────────────────────────────────────────────────────────────────────────

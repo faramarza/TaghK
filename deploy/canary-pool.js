@@ -1,0 +1,308 @@
+/**
+ * canary-pool.js — GENERATED, do not edit by hand.
+ *   regenerate: node tools/build-canary-pool.mjs
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * WHAT A CANARY IS FOR
+ *
+ * Every work manifest carries decoy targets that are not our nodes. A canary
+ * is issued to exactly ONE slot, so if that canary is ever reported blocked
+ * while other slots reach the same host fine, the reporting slot is lying —
+ * which is the signature of a censor feeding false blocks to burn healthy
+ * nodes. Attribution becomes exact instead of statistical.
+ *
+ * WHAT WAS WRONG BEFORE (04-STATUS.md defect 2.5)
+ *
+ * The pool was three hardcoded domains. A censor who enrolled twice saw the
+ * same three hosts in both manifests and identified the entire mechanism in
+ * one afternoon — after which every canary is answered truthfully and every
+ * real node is answered falsely, and the detector is worse than useless
+ * because it now certifies the attacker as trustworthy.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ *  TWO POOLS, AND AN HONEST STATEMENT OF WHAT EACH ACHIEVES
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * OPERATOR POOL (KV `canary_pool`, set via /admin/canary-pool) — the real
+ * answer. Decoy hosts the operator runs on the SAME providers and ASNs as the
+ * real fleet, serving an ordinary website and no proxy. These are not
+ * separable from real nodes by address, ASN, or TLS shape, because in every
+ * respect except purpose they are the same kind of machine. Populate this
+ * before enrolling probes; see 02-RUNBOOK.md §6.
+ *
+ * BUILTIN POOL (below, 246 hosts) — a bootstrap so the mechanism functions on
+ * day one. It is honestly weaker in one specific way: real Tier-D targets are
+ * registered by IP on VPS ASNs, while these are third-party domains on
+ * academic, CDN, and hosting ASNs. AN ATTENTIVE ADVERSARY CAN SEPARATE THEM
+ * BY SHAPE. That is a known, documented limit — not a claim of equivalence —
+ * and it is why the operator pool exists. `poolHealth()` reports it and the
+ * collector surfaces it to the operator.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ *  WHY AN UNREACHABLE CANARY MUST NEVER ACCUSE ANYONE
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * Whether any given host is reachable from inside Iran is a judgement here,
+ * not a measurement. If a host in this list is in fact blocked in country,
+ * every HONEST probe reports it down — and the naive detector would add
+ * suspicion to every honest probe while the censor, who knows better, reports
+ * it up and looks clean. The detector would run exactly backwards.
+ *
+ * So a down-report on a canary scores nothing on its own. It scores only when
+ * ANOTHER slot independently reached the same host in the same window. See
+ * collector-worker.js report(). Under-crediting is the safe direction and the
+ * only acceptable one: a false positive here is a real person, under a
+ * government that imprisons them, quietly losing the good nodes (I3).
+ *
+ * SELECTION RULES for entries in this list are documented in
+ * tools/build-canary-pool.mjs and enforced by tools + tests.
+ */
+
+export const BUILTIN_CANARY_POOL = [
+  { h: 'iana.org', g: 'standards' },
+  { h: 'www.iana.org', g: 'standards' },
+  { h: 'ietf.org', g: 'standards' },
+  { h: 'www.ietf.org', g: 'standards' },
+  { h: 'rfc-editor.org', g: 'standards' },
+  { h: 'www.rfc-editor.org', g: 'standards' },
+  { h: 'w3.org', g: 'standards' },
+  { h: 'www.w3.org', g: 'standards' },
+  { h: 'unicode.org', g: 'standards' },
+  { h: 'www.unicode.org', g: 'standards' },
+  { h: 'iso.org', g: 'standards' },
+  { h: 'www.iso.org', g: 'standards' },
+  { h: 'itu.int', g: 'standards' },
+  { h: 'www.itu.int', g: 'standards' },
+  { h: 'icann.org', g: 'standards' },
+  { h: 'www.icann.org', g: 'standards' },
+  { h: 'ripe.net', g: 'standards' },
+  { h: 'www.ripe.net', g: 'standards' },
+  { h: 'apnic.net', g: 'standards' },
+  { h: 'www.apnic.net', g: 'standards' },
+  { h: 'afrinic.net', g: 'standards' },
+  { h: 'lacnic.net', g: 'standards' },
+  { h: 'iso20022.org', g: 'standards' },
+  { h: 'ecma-international.org', g: 'standards' },
+  { h: 'khronos.org', g: 'standards' },
+  { h: 'www.khronos.org', g: 'standards' },
+  { h: 'oasis-open.org', g: 'standards' },
+  { h: 'opengroup.org', g: 'standards' },
+  { h: 'ethz.ch', g: 'university' },
+  { h: 'epfl.ch', g: 'university' },
+  { h: 'tum.de', g: 'university' },
+  { h: 'uni-heidelberg.de', g: 'university' },
+  { h: 'lmu.de', g: 'university' },
+  { h: 'uni-bonn.de', g: 'university' },
+  { h: 'rwth-aachen.de', g: 'university' },
+  { h: 'kit.edu', g: 'university' },
+  { h: 'tudelft.nl', g: 'university' },
+  { h: 'uu.nl', g: 'university' },
+  { h: 'leidenuniv.nl', g: 'university' },
+  { h: 'rug.nl', g: 'university' },
+  { h: 'ku.dk', g: 'university' },
+  { h: 'dtu.dk', g: 'university' },
+  { h: 'uio.no', g: 'university' },
+  { h: 'ntnu.no', g: 'university' },
+  { h: 'uu.se', g: 'university' },
+  { h: 'kth.se', g: 'university' },
+  { h: 'lu.se', g: 'university' },
+  { h: 'chalmers.se', g: 'university' },
+  { h: 'helsinki.fi', g: 'university' },
+  { h: 'aalto.fi', g: 'university' },
+  { h: 'cuni.cz', g: 'university' },
+  { h: 'muni.cz', g: 'university' },
+  { h: 'uw.edu.pl', g: 'university' },
+  { h: 'agh.edu.pl', g: 'university' },
+  { h: 'elte.hu', g: 'university' },
+  { h: 'bme.hu', g: 'university' },
+  { h: 'unibo.it', g: 'university' },
+  { h: 'polimi.it', g: 'university' },
+  { h: 'unipd.it', g: 'university' },
+  { h: 'uniroma1.it', g: 'university' },
+  { h: 'unimi.it', g: 'university' },
+  { h: 'ucm.es', g: 'university' },
+  { h: 'upm.es', g: 'university' },
+  { h: 'ub.edu', g: 'university' },
+  { h: 'uab.cat', g: 'university' },
+  { h: 'ulisboa.pt', g: 'university' },
+  { h: 'up.pt', g: 'university' },
+  { h: 'sorbonne-universite.fr', g: 'university' },
+  { h: 'univ-lyon1.fr', g: 'university' },
+  { h: 'unistra.fr', g: 'university' },
+  { h: 'ox.ac.uk', g: 'university' },
+  { h: 'cam.ac.uk', g: 'university' },
+  { h: 'ucl.ac.uk', g: 'university' },
+  { h: 'ed.ac.uk', g: 'university' },
+  { h: 'manchester.ac.uk', g: 'university' },
+  { h: 'bristol.ac.uk', g: 'university' },
+  { h: 'tcd.ie', g: 'university' },
+  { h: 'ucd.ie', g: 'university' },
+  { h: 'unimelb.edu.au', g: 'university' },
+  { h: 'sydney.edu.au', g: 'university' },
+  { h: 'anu.edu.au', g: 'university' },
+  { h: 'auckland.ac.nz', g: 'university' },
+  { h: 'utoronto.ca', g: 'university' },
+  { h: 'ubc.ca', g: 'university' },
+  { h: 'mcgill.ca', g: 'university' },
+  { h: 'uwaterloo.ca', g: 'university' },
+  { h: 'nus.edu.sg', g: 'university' },
+  { h: 'ntu.edu.sg', g: 'university' },
+  { h: 'u-tokyo.ac.jp', g: 'university' },
+  { h: 'kyoto-u.ac.jp', g: 'university' },
+  { h: 'titech.ac.jp', g: 'university' },
+  { h: 'kaist.ac.kr', g: 'university' },
+  { h: 'snu.ac.kr', g: 'university' },
+  { h: 'tsinghua.edu.cn', g: 'university' },
+  { h: 'metu.edu.tr', g: 'university' },
+  { h: 'boun.edu.tr', g: 'university' },
+  { h: 'itu.edu.tr', g: 'university' },
+  { h: 'bilkent.edu.tr', g: 'university' },
+  { h: 'ku.edu.tr', g: 'university' },
+  { h: 'debian.org', g: 'foss' },
+  { h: 'www.debian.org', g: 'foss' },
+  { h: 'ftp.debian.org', g: 'foss' },
+  { h: 'deb.debian.org', g: 'foss' },
+  { h: 'ubuntu.com', g: 'foss' },
+  { h: 'archlinux.org', g: 'foss' },
+  { h: 'fedoraproject.org', g: 'foss' },
+  { h: 'opensuse.org', g: 'foss' },
+  { h: 'gentoo.org', g: 'foss' },
+  { h: 'alpinelinux.org', g: 'foss' },
+  { h: 'freebsd.org', g: 'foss' },
+  { h: 'openbsd.org', g: 'foss' },
+  { h: 'netbsd.org', g: 'foss' },
+  { h: 'kernel.org', g: 'foss' },
+  { h: 'www.kernel.org', g: 'foss' },
+  { h: 'gnu.org', g: 'foss' },
+  { h: 'ftp.gnu.org', g: 'foss' },
+  { h: 'fsf.org', g: 'foss' },
+  { h: 'apache.org', g: 'foss' },
+  { h: 'nginx.org', g: 'foss' },
+  { h: 'postgresql.org', g: 'foss' },
+  { h: 'sqlite.org', g: 'foss' },
+  { h: 'python.org', g: 'foss' },
+  { h: 'www.python.org', g: 'foss' },
+  { h: 'ruby-lang.org', g: 'foss' },
+  { h: 'perl.org', g: 'foss' },
+  { h: 'php.net', g: 'foss' },
+  { h: 'go.dev', g: 'foss' },
+  { h: 'rust-lang.org', g: 'foss' },
+  { h: 'nodejs.org', g: 'foss' },
+  { h: 'llvm.org', g: 'foss' },
+  { h: 'cmake.org', g: 'foss' },
+  { h: 'git-scm.com', g: 'foss' },
+  { h: 'videolan.org', g: 'foss' },
+  { h: 'ffmpeg.org', g: 'foss' },
+  { h: 'gimp.org', g: 'foss' },
+  { h: 'inkscape.org', g: 'foss' },
+  { h: 'blender.org', g: 'foss' },
+  { h: 'libreoffice.org', g: 'foss' },
+  { h: 'documentfoundation.org', g: 'foss' },
+  { h: 'kde.org', g: 'foss' },
+  { h: 'gnome.org', g: 'foss' },
+  { h: 'xfce.org', g: 'foss' },
+  { h: 'mozilla.org', g: 'foss' },
+  { h: 'openssl.org', g: 'foss' },
+  { h: 'openssh.com', g: 'foss' },
+  { h: 'curl.se', g: 'foss' },
+  { h: 'varnish-cache.org', g: 'foss' },
+  { h: 'redis.io', g: 'foss' },
+  { h: 'rabbitmq.com', g: 'foss' },
+  { h: 'elastic.co', g: 'foss' },
+  { h: 'grafana.com', g: 'foss' },
+  { h: 'prometheus.io', g: 'foss' },
+  { h: 'kubernetes.io', g: 'foss' },
+  { h: 'docker.com', g: 'foss' },
+  { h: 'ansible.com', g: 'foss' },
+  { h: 'terraform.io', g: 'foss' },
+  { h: 'vim.org', g: 'foss' },
+  { h: 'gnu.org.ua', g: 'foss' },
+  { h: 'tug.org', g: 'foss' },
+  { h: 'ctan.org', g: 'foss' },
+  { h: 'r-project.org', g: 'foss' },
+  { h: 'octave.org', g: 'foss' },
+  { h: 'scilab.org', g: 'foss' },
+  { h: 'sagemath.org', g: 'foss' },
+  { h: 'qt.io', g: 'foss' },
+  { h: 'gtk.org', g: 'foss' },
+  { h: 'freedesktop.org', g: 'foss' },
+  { h: 'x.org', g: 'foss' },
+  { h: 'wireshark.org', g: 'foss' },
+  { h: 'gnupg.org', g: 'foss' },
+  { h: 'openwrt.org', g: 'foss' },
+  { h: 'raspberrypi.com', g: 'foss' },
+  { h: 'arduino.cc', g: 'foss' },
+  { h: 'pypi.org', g: 'registry' },
+  { h: 'files.pythonhosted.org', g: 'registry' },
+  { h: 'rubygems.org', g: 'registry' },
+  { h: 'crates.io', g: 'registry' },
+  { h: 'static.crates.io', g: 'registry' },
+  { h: 'repo1.maven.org', g: 'registry' },
+  { h: 'packagist.org', g: 'registry' },
+  { h: 'registry.npmjs.org', g: 'registry' },
+  { h: 'cdn.jsdelivr.net', g: 'registry' },
+  { h: 'unpkg.com', g: 'registry' },
+  { h: 'cdnjs.cloudflare.com', g: 'registry' },
+  { h: 'hub.docker.com', g: 'registry' },
+  { h: 'registry-1.docker.io', g: 'registry' },
+  { h: 'quay.io', g: 'registry' },
+  { h: 'mirrors.kernel.org', g: 'registry' },
+  { h: 'mirror.leaseweb.com', g: 'registry' },
+  { h: 'mirror.hetzner.com', g: 'registry' },
+  { h: 'ftp.fau.de', g: 'registry' },
+  { h: 'mirror.aarnet.edu.au', g: 'registry' },
+  { h: 'ftp.jaist.ac.jp', g: 'registry' },
+  { h: 'mirror.yandex.ru', g: 'registry' },
+  { h: 'mirrors.tuna.tsinghua.edu.cn', g: 'registry' },
+  { h: 'cern.ch', g: 'science' },
+  { h: 'home.cern', g: 'science' },
+  { h: 'esa.int', g: 'science' },
+  { h: 'arxiv.org', g: 'science' },
+  { h: 'doi.org', g: 'science' },
+  { h: 'crossref.org', g: 'science' },
+  { h: 'orcid.org', g: 'science' },
+  { h: 'zenodo.org', g: 'science' },
+  { h: 'ncbi.nlm.nih.gov', g: 'science' },
+  { h: 'who.int', g: 'science' },
+  { h: 'un.org', g: 'science' },
+  { h: 'worldbank.org', g: 'science' },
+  { h: 'imf.org', g: 'science' },
+  { h: 'oecd.org', g: 'science' },
+  { h: 'fao.org', g: 'science' },
+  { h: 'unesco.org', g: 'science' },
+  { h: 'wmo.int', g: 'science' },
+  { h: 'noaa.gov', g: 'science' },
+  { h: 'usgs.gov', g: 'science' },
+  { h: 'copernicus.eu', g: 'science' },
+  { h: 'ecmwf.int', g: 'science' },
+  { h: 'emcwf.int', g: 'science' },
+  { h: 'nature.com', g: 'science' },
+  { h: 'springer.com', g: 'science' },
+  { h: 'sciencedirect.com', g: 'science' },
+  { h: 'ieee.org', g: 'science' },
+  { h: 'acm.org', g: 'science' },
+  { h: 'siam.org', g: 'science' },
+  { h: 'ams.org', g: 'science' },
+  { h: 'aps.org', g: 'science' },
+  { h: 'iop.org', g: 'science' },
+  { h: 'rsc.org', g: 'science' },
+  { h: 'openstreetmap.org', g: 'infra' },
+  { h: 'nominatim.openstreetmap.org', g: 'infra' },
+  { h: 'tile.openstreetmap.org', g: 'infra' },
+  { h: 'geonames.org', g: 'infra' },
+  { h: 'timeanddate.com', g: 'infra' },
+  { h: 'worldtimeapi.org', g: 'infra' },
+  { h: 'ntppool.org', g: 'infra' },
+  { h: 'www.ntp.org', g: 'infra' },
+  { h: 'iperf.fr', g: 'infra' },
+  { h: 'speedtest.net', g: 'infra' },
+  { h: 'stat.ripe.net', g: 'infra' },
+  { h: 'bgp.he.net', g: 'infra' },
+  { h: 'peeringdb.com', g: 'infra' },
+  { h: 'ixpdb.euro-ix.net', g: 'infra' },
+  { h: 'de-cix.net', g: 'infra' },
+  { h: 'linx.net', g: 'infra' },
+  { h: 'ams-ix.net', g: 'infra' },
+  { h: 'netnod.se', g: 'infra' },
+  { h: 'equinix.com', g: 'infra' },
+];

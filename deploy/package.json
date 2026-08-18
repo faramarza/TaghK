@@ -8,12 +8,19 @@
     "@noble/hashes": "^1.4.0"
   },
   "devDependencies": {
-    "wrangler": "^3.60.0"
+    "wrangler": "^4.123.0"
   },
   "scripts": {
     "deploy:distributor": "wrangler deploy -c wrangler.toml",
     "deploy:collector": "wrangler deploy -c wrangler.collector.toml",
     "keygen:voprf": "node -e \"import('./voprf.js').then(m=>console.log(JSON.stringify(m.generateKey(),null,2)))\"",
-    "keygen:manifest": "node -e \"const{generateKeyPairSync}=require('crypto');const{publicKey,privateKey}=generateKeyPairSync('ed25519');console.log('MANIFEST_SK (secret, base64 pkcs8):');console.log(privateKey.export({type:'pkcs8',format:'der'}).toString('base64'));console.log('\\nOPERATOR_PUBKEY (pin into probe agents, base64 raw):');console.log(publicKey.export({type:'spki',format:'der'}).subarray(12).toString('base64'));\""
+    "keygen:manifest": "node -e \"const{generateKeyPairSync}=require('crypto');const{publicKey,privateKey}=generateKeyPairSync('ed25519');console.log('MANIFEST_SK (secret, base64 pkcs8):');console.log(privateKey.export({type:'pkcs8',format:'der'}).toString('base64'));console.log('\\nOPERATOR_PUBKEY (pin into probe agents, base64 raw):');console.log(publicKey.export({type:'spki',format:'der'}).subarray(12).toString('base64'));\"",
+    "test": "./test/run-all.sh",
+    "test:crypto": "node selftest.mjs",
+    "test:race": "node test/kv-race.test.mjs",
+    "test:canary": "node test/canary.test.mjs",
+    "test:distributor": "node test/distributor.test.mjs",
+    "test:collector": "node test/collector.test.mjs",
+    "build:canary-pool": "node tools/build-canary-pool.mjs"
   }
 }
