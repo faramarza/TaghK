@@ -1,0 +1,179 @@
+{
+  "//": [
+    "PLANE 4 — client template (sing-box). Automatic tier failover, zero user decisions.",
+    "",
+    "THE MOST COMMON CAUSE OF TOTAL SYSTEM FAILURE IS NOT BLOCKING.",
+    "It is that people did not install the tool, could not configure it, or gave",
+    "up when it broke. Every design choice here serves one goal: the user opens",
+    "the app, it connects, and it keeps working without them ever learning the",
+    "word 'REALITY'.",
+    "",
+    "The 'auto' selector races all tiers and picks whatever currently works.",
+    "When Tier D is blocklisted, Tier A takes over silently. When a whitelist",
+    "comes down and only CDN traffic survives, Tier A is already the winner.",
+    "When everything the operator owns is gone, Tor/Snowflake carries the floor.",
+    "",
+    "Endpoints below are PLACEHOLDERS. In production the client fetches them from",
+    "the distributor subscription URL and rewrites this file on every poll."
+  ],
+
+  "log": { "level": "error", "timestamp": false },
+
+  "dns": {
+    "//": "DoH over the tunnel only. A plaintext :53 lookup leaks every destination to the ISP and is trivially hijacked to a block page.",
+    "servers": [
+      { "tag": "remote", "address": "https://1.1.1.1/dns-query", "detour": "auto" },
+      { "tag": "block",  "address": "rcode://success" }
+    ],
+    "rules": [
+      { "outbound": "any", "server": "remote" },
+      { "rule_set": "geosite-category-ads", "server": "block" }
+    ],
+    "strategy": "prefer_ipv4",
+    "independent_cache": true
+  },
+
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true,
+      "strict_route": true,
+      "stack": "mixed",
+      "sniff": true,
+      "sniff_override_destination": false
+    }
+  ],
+
+  "outbounds": [
+    {
+      "//": "USER-FACING SELECTOR. The only thing a person would ever touch, and they should not have to.",
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["auto", "tier-a-cdn", "tier-d-reality", "tier-b-tor", "direct"],
+      "default": "auto"
+    },
+
+    {
+      "//": [
+        "AUTOMATIC FAILOVER. Races every tier and uses the fastest that responds.",
+        "interrupt_exist_connections=false so a switch does not drop a live call.",
+        "This is what makes burns invisible to the user."
+      ],
+      "type": "urltest",
+      "tag": "auto",
+      "outbounds": ["tier-a-cdn", "tier-d-reality", "tier-b-tor"],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "tolerance": 100,
+      "idle_timeout": "30m",
+      "interrupt_exist_connections": false
+    },
+
+    {
+      "//": [
+        "TIER A — CDN-fronted. THE WHITELIST-PROOF PATH.",
+        "Terminates at Cloudflare IPs. Blocking it means blocking a large slice",
+        "of the working web, including whitelisted sites. Slower than Tier D but",
+        "structurally far harder to kill. Listed FIRST on purpose: under",
+        "default-deny it is the only thing that survives."
+      ],
+      "type": "vless",
+      "tag": "tier-a-cdn",
+      "server": "cdn.example.com",
+      "server_port": 443,
+      "uuid": "PER-USER-UUID-FROM-SUBSCRIPTION",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "cdn.example.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" }
+      },
+      "transport": { "type": "ws", "path": "/PLACEHOLDER-WS-PATH", "max_early_data": 2048, "early_data_header_name": "Sec-WebSocket-Protocol" }
+    },
+
+    {
+      "//": [
+        "TIER D — direct REALITY. Throughput.",
+        "REALITY borrows a real third-party certificate chain, so an active probe",
+        "gets a genuine response from the genuine site. This does not make the node",
+        "unblockable — it forces the censor from cheap protocol-matching up to",
+        "expensive IP enumeration. utls fingerprint is MANDATORY: without it the",
+        "ClientHello identifies this as a Go program no matter how good the rest is."
+      ],
+      "type": "vless",
+      "tag": "tier-d-reality",
+      "server": "203.0.113.10",
+      "server_port": 443,
+      "uuid": "PER-USER-UUID-FROM-SUBSCRIPTION",
+      "flow": "xtls-rprx-vision",
+      "packet_encoding": "xudp",
+      "tls": {
+        "enabled": true,
+        "server_name": "www.apple.com",
+        "utls": { "enabled": true, "fingerprint": "chrome" },
+        "reality": { "enabled": true, "public_key": "PLACEHOLDER-PUBLIC-KEY", "short_id": "PLACEHOLDER" }
+      }
+    },
+
+    {
+      "//": [
+        "TIER B — the floor. Requires nothing from the operator and cannot be",
+        "burned by operator mistakes. Slow, but it is what remains when every",
+        "server we run is blocklisted. Point at a local Tor client running",
+        "Snowflake or WebTunnel."
+      ],
+      "type": "socks",
+      "tag": "tier-b-tor",
+      "server": "127.0.0.1",
+      "server_port": 9050,
+      "version": "5"
+    },
+
+    { "type": "direct", "tag": "direct" },
+    { "type": "block",  "tag": "block"  }
+  ],
+
+  "route": {
+    "//": "Domestic and private traffic goes direct. Routing local banking through a foreign tunnel is slow, breaks sites, and makes the tunnel conspicuous in traffic analysis.",
+    "rules": [
+      { "action": "sniff" },
+      { "protocol": "dns", "action": "hijack-dns" },
+      { "ip_is_private": true, "outbound": "direct" },
+      { "rule_set": "geoip-ir", "outbound": "direct" },
+      { "rule_set": "geosite-ir", "outbound": "direct" },
+      { "rule_set": "geosite-category-ads", "outbound": "block" }
+    ],
+    "rule_set": [
+      {
+        "tag": "geoip-ir",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-ir.srs",
+        "download_detour": "auto"
+      },
+      {
+        "tag": "geosite-ir",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ir.srs",
+        "download_detour": "auto"
+      },
+      {
+        "tag": "geosite-category-ads",
+        "type": "remote",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ads-all.srs",
+        "download_detour": "auto"
+      }
+    ],
+    "final": "proxy",
+    "auto_detect_interface": true
+  },
+
+  "experimental": {
+    "cache_file": { "enabled": true, "store_fakeip": false },
+    "clash_api": { "external_controller": "127.0.0.1:9090" }
+  }
+}

@@ -1,0 +1,27 @@
+# Collector — PLANE 3 front end. Measurement only.
+#
+# DEPLOYED SEPARATELY FROM THE DISTRIBUTOR ON PURPOSE.
+# Different Worker, different KV, different admin key. Compromising the
+# measurement plane must not yield the credential-issuance plane. Co-locating
+# these for convenience merges both blast radii.
+
+name = "collect"
+main = "collector-worker.js"
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "PROBES"            # wrangler kv namespace create PROBES
+id = "REPLACE_PROBES_ID"
+
+[[kv_namespaces]]
+binding = "MEASUREMENTS"      # wrangler kv namespace create MEASUREMENTS
+id = "REPLACE_MEASUREMENTS_ID"
+
+# Secrets — set with `wrangler secret put <NAME> -c wrangler.collector.toml`
+#   PROBE_HMAC_KEY   openssl rand -hex 32
+#   MANIFEST_SK      npm run keygen:manifest   (Ed25519 PKCS#8, base64)
+#   COLLECTOR_ADMIN  openssl rand -hex 32      MUST DIFFER from ADMIN_KEY
+#   ENROL_SALT       openssl rand -hex 32      never rotate
+
+[observability]
+enabled = false               # no logs, architecturally — not as policy

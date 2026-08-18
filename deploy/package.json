@@ -1,0 +1,19 @@
+{
+  "name": "circumvention-distributor",
+  "private": true,
+  "type": "module",
+  "description": "Anonymous, accountable credential distribution (Plane 1) + measurement collection (Plane 3)",
+  "dependencies": {
+    "@noble/curves": "^1.4.0",
+    "@noble/hashes": "^1.4.0"
+  },
+  "devDependencies": {
+    "wrangler": "^3.60.0"
+  },
+  "scripts": {
+    "deploy:distributor": "wrangler deploy -c wrangler.toml",
+    "deploy:collector": "wrangler deploy -c wrangler.collector.toml",
+    "keygen:voprf": "node -e \"import('./voprf.js').then(m=>console.log(JSON.stringify(m.generateKey(),null,2)))\"",
+    "keygen:manifest": "node -e \"const{generateKeyPairSync}=require('crypto');const{publicKey,privateKey}=generateKeyPairSync('ed25519');console.log('MANIFEST_SK (secret, base64 pkcs8):');console.log(privateKey.export({type:'pkcs8',format:'der'}).toString('base64'));console.log('\\nOPERATOR_PUBKEY (pin into probe agents, base64 raw):');console.log(publicKey.export({type:'spki',format:'der'}).subarray(12).toString('base64'));\""
+  }
+}

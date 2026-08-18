@@ -1,0 +1,28 @@
+# Distributor — PLANE 1. Credential issuance only.
+#
+# Deploying on Workers is deliberate: *.workers.dev rides CDN infrastructure a
+# censor generally cannot afford to block, which puts the distribution channel
+# in a DIFFERENT FAILURE DOMAIN than the transport it describes. If the
+# subscription URL dies with the proxies, you are hand-delivering configs to
+# millions of people.
+
+name = "dist"
+main = "distributor-worker.js"
+compatibility_date = "2026-01-01"
+
+[[kv_namespaces]]
+binding = "ACCOUNTS"          # wrangler kv namespace create ACCOUNTS
+id = "REPLACE_ACCOUNTS_ID"
+
+[[kv_namespaces]]
+binding = "NODES"             # wrangler kv namespace create NODES
+id = "REPLACE_NODES_ID"
+
+# Secrets — set with `wrangler secret put <NAME>`
+#   ADMIN_KEY   openssl rand -hex 32   rotate quarterly
+#   KEY_SALT    openssl rand -hex 32   NEVER ROTATE (invalidates all digests)
+#                                      MUST DIFFER from ADMIN_KEY
+#   VOPRF_SK    npm run keygen:voprf
+
+[observability]
+enabled = false               # no logs, architecturally — not as policy
