@@ -227,19 +227,6 @@ so the anonymity set is partitioned by issuance period instead of being global.
 With a 30-day epoch the server learns "issued this month or last month". Do not
 shorten `EPOCH_LENGTH_S` — a smaller epoch is a smaller crowd to hide in.
 
-#### 2.8a Lost updates on the reverse index and suspicion — *closed*
-
-`idx:<node>` and `lin:<id>.suspicion` were read-then-writes on KV. A lost append
-to the reverse index meant a lineage **escaped attribution entirely, in
-silence** — and since the censor is by construction the lineage holding the most
-burned nodes, the mechanism failed hardest against the adversary it exists for.
-
-**Closed by** ADR-0005: an `Attribution` Durable Object holds both. The lineage
-blob stays in KV because it is read on every subscription poll; only the values
-written concurrently moved. These helpers deliberately fail OPEN — denying
-credentials because a bookkeeping object blinked would cost a real person their
-connection to protect a reputation score (I3).
-
 #### 2.15 The subscription URL was built from the request's own origin — *closed*
 
 `getCredentials()` returned `${new URL(request.url).origin}/sub/…`. Behind
@@ -285,6 +272,52 @@ because a skipped anchor would otherwise look identical to a working one.
 
 **Residual, and it is weaker — see 2.18.**
 
+#### 2.8 Lost updates on inventory, the reverse index and suspicion — *closed*
+
+Three read-then-writes on KV. The reverse index was the dangerous one: a lost
+append meant a lineage **escaped attribution entirely, in silence**, and since
+the censor is by construction the lineage holding the most burned nodes, the
+mechanism failed hardest against the adversary it exists for.
+
+**Closed by** ADR-0005 (an `Attribution` Durable Object for the index and
+suspicion) and a `Registry` Durable Object for operator-mutable state —
+inventory, fallbacks, and the stored commitment serial. The realistic inventory
+race was never two humans: it is an operator edit landing while
+`control-plane.py` marks a node blocked, and a node silently un-blocked by a
+lost write keeps being handed to users. Reads stay on KV; the Registry is the
+authority and KV the mirror.
+
+Tested with twelve concurrent node writes racing a burn: all twelve survive, the
+burn is not overwritten, and the KV mirror the subscription path reads reflects
+it.
+
+#### 2.11 An unreachable canary could accuse an honest volunteer — *closed*
+
+The 246 builtin canary hosts were chosen by judgement, not measurement. A host
+that is in fact blocked in country is reported down by every honest probe.
+
+**Closed by three conditions, all required before a canary down-report scores:**
+the host must be **validated** (independently reached by at least two distinct
+slots, tracked persistently — a host nobody has ever reached is inert and can
+accuse nobody); the report must be **corroborated** (someone else reached it in
+the same window, so it is not a transient outage everyone sees); and at most
+**one credit per report**, not per canary — previously two canaries in one
+manifest meant a single bad report demoted a slot outright, so a volunteer whose
+mobile connection dropped for five minutes looked exactly like a censor.
+
+Suspicion also now **decays** (0.1/day). "Demote, never ban" is not honoured by a
+demotion that is permanent: a volunteer implicated by bad luck would lose the
+good nodes forever. A censor must stop lying for weeks to recover the same
+ground, and learns little meanwhile.
+
+**The cost is slower detection, and it is real:** the integration suite's
+hostile probe now takes four rounds of lying to be demoted rather than two. That
+is the trade, made deliberately in the direction that does not punish people.
+
+`/admin/canary-health` shows the operator which hosts have been validated and
+which are inert, so a dead pool can be pruned — without ever revealing which
+slot reported what.
+
 #### 2.16 The node forwarded a client address into Xray — *new, closed*
 
 `bootstrap.sh` set `proxy_set_header X-Real-IP $remote_addr` on the WebSocket
@@ -327,7 +360,7 @@ found. That provider shortlist is now open work — see
 
 ### OPEN
 
-#### 2.18 A malicious operator can still equivocate on the key commitment — *open, needs P7*
+#### 2.18 A malicious operator can still equivocate on the key commitment — *open, narrowed, needs P7*
 
 The residual of 2.17, recorded separately because it is a materially weaker
 property than the one that was closed.
@@ -341,14 +374,31 @@ What exists today makes it leave evidence: monotonic serials plus a hash chain
 over predecessors, client-side rollback refusal, and a byte-identical document
 served from a stable public location.
 
-What is missing to make that evidence usable:
+**Two of the three missing pieces are now built:**
+
+- `crossCheckCommitment()` / `requireAgreement()` in `commitment.js` compare a
+  served commitment against independently fetched copies. Same serial with
+  different bytes is equivocation and fails closed; a mirror that is merely
+  ahead raises the client's serial floor, which then makes the rolled-back
+  document the server offered fail the rollback check; an unreachable mirror is
+  ignored, because treating censorship of a mirror as an attack would hand the
+  censor an off switch for the client.
+- `tools/verify-commitment.mjs` lets **anyone** run that comparison from the
+  command line against live endpoints, and prints both hashes when it finds a
+  split so the finding can be published.
+- `docs/VERIFY.md` and `docs/VERIFY.fa.md` are the user-facing procedure. **The
+  Persian is an unreviewed draft and must not be published to users until a
+  native speaker has reviewed it (I10).**
+
+**What remains:**
 
 1. **Reproducible, signed client builds (P7)** so the pinned key is verifiably
-   the one in the published source. A pinned key nobody can check is a promise.
-2. **An independent mirror** of the commitment document, outside the operator's
-   control, so a client or a researcher can compare what they were served.
-3. **A published comparison procedure**, in Persian, that a non-technical user
-   or a local technologist can actually follow.
+   the one in the published source. A pinned key nobody can check is a promise,
+   and the tooling above verifies against whatever key you hand it.
+2. **An independent mirror actually operated**, outside the operator's control.
+   The mechanism exists; nobody is running one.
+3. **Native review of the Persian**, and publication of the procedure somewhere
+   users will find it.
 
 Until all three exist the honest claim is: *a compromised server cannot tag; a
 malicious operator can, but not invisibly, and not to a client that has already
@@ -356,28 +406,6 @@ seen a later commitment.* Do not state it more strongly than that in any
 user-facing material.
 
 **This makes P7 a dependency of the anonymity claim, not a trust nicety.**
-
-#### 2.8 Node inventory can still lose concurrent operator writes — *low*
-
-The reverse index and the suspicion counters moved to Durable Objects
-(ADR-0005); `inventory` did not. Two operators writing the node list at the same
-moment can still clobber each other.
-
-Out of the decided scope, operator-side rather than user-facing, and the failure
-mode is two admins racing rather than an adversary. Left open deliberately
-rather than quietly closed.
-
-#### 2.11 Builtin canary reachability from inside Iran is unverified — *blocks P5*
-
-The 246 builtin canary hosts were chosen by judgement, not measurement. If one
-is in fact blocked in country, every honest probe reports it down.
-
-The corroboration rule added in ADR-0003 makes this **harmless rather than
-harmful** — an unreachable canary simply never scores, instead of accusing
-honest volunteers. But the pool still needs empirical validation from the first
-honest probes before their reports are allowed to influence anything, and the
-operator pool needs populating before decoys stop being separable from real
-nodes by address shape. Both are P5 prerequisites and are listed in ADR-0003.
 
 
 ---
@@ -439,7 +467,7 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Largely addressed. `deploy/test/` runs **265 checks across eight suites**:
+Largely addressed. `deploy/test/` runs **287 checks across eight suites**:
 
 | Suite | What it runs |
 |---|---|

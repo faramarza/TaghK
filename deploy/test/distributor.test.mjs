@@ -399,6 +399,37 @@ try {
       'a second burn of the same node implicates nobody twice — the index is drained atomically');
   }
 
+  section('2.8 — concurrent operator writes do not clobber each other');
+  {
+    // The realistic race is not two humans: it is an operator edit landing while
+    // control-plane.py marks a node blocked. Under KV each side read the list
+    // without the other's change and one write was lost — and a node silently
+    // un-blocked by a lost write keeps being handed to users.
+    const before = (await (await w.fetch('http://d/admin/nodes', { headers: { 'x-admin-key': ADMIN_KEY } })).json()).length;
+    const writes = Array.from({ length: 12 }, (_, i) =>
+      post('/admin/nodes', [{ id: `race${String(i).padStart(4, '0')}`, pool: 'standard', ip: '203.0.113.99' }],
+        { 'x-admin-key': ADMIN_KEY }));
+    const burn = post('/admin/report-blocked', { node_id: 'node0001' }, { 'x-admin-key': ADMIN_KEY });
+    await Promise.all([...writes, burn]);
+
+    const inv = await (await w.fetch('http://d/admin/nodes', { headers: { 'x-admin-key': ADMIN_KEY } })).json();
+    eq(inv.length, before + 12, 'every concurrent node write survived');
+    eq(inv.filter((n) => n.id.startsWith('race')).length, 12, 'none was lost to a clobber');
+    eq(inv.find((n) => n.id === 'node0001').status, 'blocked',
+      'and a burn landing in the same instant was not overwritten');
+
+    // The subscription path reads the KV mirror, not the Registry. Confirm the
+    // burn actually reached it, or a blocked node keeps being served.
+    const ts2 = Date.now();
+    const sub2 = await w.fetch(`http://d/sub/${credJson.lineage}`, {
+      headers: { ...IP, 'x-device-ts': String(ts2),
+                 'x-device-sig': await device.sign(`${credJson.lineage}:${ts2}`) },
+    });
+    const served = Buffer.from(await sub2.text(), 'base64').toString('utf8');
+    check(!served.includes('11111111-1111-1111-1111-111111111111'),
+      'the KV mirror the subscription reads reflects the burn');
+  }
+
   section('retention — rate-limit rows must not become a log');
   {
     // A SOURCE-LEVEL guard, not a behavioural test, and labelled as one. DO

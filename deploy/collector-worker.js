@@ -87,7 +87,49 @@ const CFG = {
   SLOT_SUSPICION_THRESHOLD: 2.0,
   RATE_LIMIT_PER_MIN: 20,
   NONCE_TTL_S: 7 * 86400,
+
+  // A canary host cannot accuse anyone until this many DISTINCT slots have
+  // independently reached it. Whether a given host is reachable from inside
+  // Iran is a judgement when the pool is built, not a measurement; a host that
+  // turns out to be blocked in country is reported down by every honest probe,
+  // and without this it would accuse all of them while the censor — who knows
+  // which hosts are blocked — reports it up and looks clean (04-STATUS.md 2.11).
+  CANARY_VALIDATION_SLOTS: 2,
+  CANARY_VALIDATION_TTL_S: 60 * 86400,
+
+  // At most this much suspicion per REPORT, however many canaries were lied
+  // about in it.
+  //
+  // Before this, each corroborated canary scored separately, so a manifest with
+  // two canaries meant one bad report reached the threshold and demoted the
+  // slot outright. A volunteer whose mobile connection drops for five minutes
+  // reports everything unreachable, including both canaries, and looked exactly
+  // like a censor.
+  //
+  // Requiring two separate reports means roughly half an hour of continuous
+  // failure before a demotion — long for a transient outage, trivial for a
+  // censor who intends to keep lying. That is the trade being made here, and it
+  // is a trade rather than a free win: detection is slower on purpose.
+  MAX_SUSPICION_PER_REPORT: 1.0,
+
+  // Suspicion decays. "Demote, never ban" (I3) is not honoured by a demotion
+  // that is permanent: an honest volunteer implicated by bad luck would lose
+  // the good nodes forever. A censor has to stop lying for weeks to recover the
+  // same ground, and learns little in the meantime.
+  SUSPICION_DECAY_PER_DAY: 0.1,
 };
+
+/**
+ * Suspicion as it stands NOW, after decay. Computed on read — no background
+ * job, nothing to forget to run.
+ */
+function effectiveSuspicion(state) {
+  const raw = state?.suspicion || 0;
+  if (raw <= 0) return 0;
+  const since = state.suspicion_at ? Date.now() - state.suspicion_at : 0;
+  const decayed = raw - (since / 86400e3) * CFG.SUSPICION_DECAY_PER_DAY;
+  return Math.max(0, decayed);
+}
 
 export default {
   async fetch(request, env) {
@@ -100,6 +142,7 @@ export default {
         case '/admin/verdicts': return await verdicts(request, env);
         case '/admin/targets':  return await setTargets(request, env);
         case '/admin/canary-pool': return await canaryPool(request, env);
+        case '/admin/canary-health': return await canaryHealth(request, env);
         case '/admin/enrol-codes': return await mintCodes(request, env);
         default:                return decoy();
       }
@@ -274,7 +317,7 @@ async function manifest(request, env) {
   if (!state) return decoy();
 
   const targets = JSON.parse((await env.MEASUREMENTS.get('targets')) || '[]');
-  const hostile = state.suspicion >= CFG.SLOT_SUSPICION_THRESHOLD;
+  const hostile = effectiveSuspicion(state) >= CFG.SLOT_SUSPICION_THRESHOLD;
 
   const nReal = hostile ? CFG.CANARY_HEAVY_REAL : CFG.REAL_TARGETS_PER_MANIFEST;
   const nDecoy = hostile ? CFG.CANARY_HEAVY_DECOY : CFG.CANARIES_PER_MANIFEST;
@@ -349,14 +392,33 @@ async function manifest(request, env) {
  * verdict, and a stale read can only under-credit suspicion (see report()).
  */
 async function recordCanaryObservation(env, host, slot, up, window) {
-  const key = `cm:${window}:${(await hmac(env, `canary-host:${host}`)).slice(0, 24)}`;
+  const hostKey = (await hmac(env, `canary-host:${host}`)).slice(0, 24);
+
+  // Per-window corroboration: did anyone ELSE reach this host right now?
+  const key = `cm:${window}:${hostKey}`;
   const agg = JSON.parse((await env.MEASUREMENTS.get(key)) || '{"up":[],"down":[]}');
   const bucket = up ? agg.up : agg.down;
   if (!bucket.includes(slot)) bucket.push(slot);
   agg.up = agg.up.slice(-256);        // bounded: one vote per slot, capped
   agg.down = agg.down.slice(-256);
   await env.MEASUREMENTS.put(key, JSON.stringify(agg), { expirationTtl: 7 * 86400 });
-  return agg.up.some((s) => s !== slot);
+
+  // Long-lived validation: has this host EVER been reached, by enough distinct
+  // slots to believe it is reachable from inside the country at all? A host
+  // that never clears this bar simply never accuses anyone — which is what a
+  // pool built by judgement rather than measurement requires.
+  const vKey = `cv:${hostKey}`;
+  const seen = JSON.parse((await env.MEASUREMENTS.get(vKey)) || '{"slots":[]}');
+  if (up && !seen.slots.includes(slot) && seen.slots.length < 64) {
+    seen.slots.push(slot);
+    await env.MEASUREMENTS.put(vKey, JSON.stringify(seen),
+      { expirationTtl: CFG.CANARY_VALIDATION_TTL_S });
+  }
+
+  return {
+    corroborated: agg.up.some((s) => s !== slot),
+    validated: seen.slots.filter((s) => s !== slot).length >= CFG.CANARY_VALIDATION_SLOTS,
+  };
 }
 
 async function report(request, env) {
@@ -377,6 +439,7 @@ async function report(request, env) {
   state.reports = (state.reports || 0) + 1;
 
   const window = Math.floor(Date.now() / 1000 / CFG.REPORT_WINDOW_S) * CFG.REPORT_WINDOW_S;
+  let lied = false;
 
   for (const r of results) {
     if (typeof r?.ref !== 'string' || r.ref.length > 64) continue;
@@ -396,10 +459,18 @@ async function report(request, env) {
       // The corroboration read is from KV and may be stale, which can only
       // UNDER-credit suspicion. That is the correct direction to fail: a false
       // positive here is a real person quietly losing the good nodes (I3).
-      const corroborated = await recordCanaryObservation(env, canary.host, slot, r.tcp === true, window);
-      if (r.tcp === false && corroborated) {
-        state.suspicion = (state.suspicion || 0) + 1.0;
-      }
+      const seen = await recordCanaryObservation(env, canary.host, slot, r.tcp === true, window);
+
+      // THREE conditions, all required, and every one exists to avoid accusing
+      // an honest volunteer:
+      //   validated    — this host is known reachable in-country by other slots,
+      //                  so a down-report is a claim about the network and not
+      //                  about a host that is simply blocked here for everyone;
+      //   corroborated — someone else reached it in THIS window, so it is not a
+      //                  transient outage everyone is seeing;
+      //   once/report  — counted below, outside this loop, so lying about two
+      //                  canaries at once is worth no more than lying about one.
+      if (r.tcp === false && seen.validated && seen.corroborated) lied = true;
       continue;                       // canary results never touch node verdicts
     }
 
@@ -408,6 +479,14 @@ async function report(request, env) {
     const bucket = r.tcp ? agg.up : agg.down;
     if (!bucket.includes(slot)) bucket.push(slot);   // one vote per slot per window
     await env.MEASUREMENTS.put(key, JSON.stringify(agg), { expirationTtl: 7 * 86400 });
+  }
+
+  // One credit per report, regardless of how many canaries were lied about.
+  // Applied to the DECAYED value so a slot that has been clean for weeks starts
+  // from where it actually stands, not from a number it earned months ago.
+  if (lied) {
+    state.suspicion = effectiveSuspicion(state) + CFG.MAX_SUSPICION_PER_REPORT;
+    state.suspicion_at = Date.now();
   }
 
   await env.PROBES.put(`slot:${slot}`, JSON.stringify(state), { expirationTtl: 180 * 86400 });
@@ -469,6 +548,41 @@ async function canaryPool(request, env) {
 }
 
 /**
+ * Which canary hosts have actually proved reachable from inside the country.
+ *
+ * An unvalidated host is inert — it can never accuse anyone — but it is also
+ * wasted manifest space and a hint that the pool needs pruning. This is how an
+ * operator finds out which of their decoys are dead, without ever learning
+ * which slot reported what.
+ *
+ * Counts and hostnames only. No slots, no addresses, no timing.
+ */
+async function canaryHealth(request, env) {
+  if (!ctEqual(request.headers.get('x-admin-key') || '', env.COLLECTOR_ADMIN)) return decoy();
+
+  const pool = effectivePool(JSON.parse((await env.MEASUREMENTS.get('canary_pool')) || 'null'));
+  const validated = [];
+  const pending = [];
+  for (const entry of pool.slice(0, 512)) {
+    const vKey = `cv:${(await hmac(env, `canary-host:${entry.host}`)).slice(0, 24)}`;
+    const seen = JSON.parse((await env.MEASUREMENTS.get(vKey)) || '{"slots":[]}');
+    (seen.slots.length >= CFG.CANARY_VALIDATION_SLOTS ? validated : pending).push({
+      host: entry.host, origin: entry.origin, reached_by: seen.slots.length,
+    });
+  }
+
+  return json({
+    required_slots: CFG.CANARY_VALIDATION_SLOTS,
+    validated: validated.length,
+    pending: pending.length,
+    note: 'pending hosts are inert — they cannot raise suspicion against any slot',
+    // Truncated: an operator wants to prune, not to page through a pool.
+    pending_hosts: pending.slice(0, 50).map((p) => p.host),
+    validated_hosts: validated.slice(0, 50).map((p) => p.host),
+  });
+}
+
+/**
  * Quorum verdicts for the control plane.
  *
  * A node counts as blocked only when QUORUM independent slots report it down
@@ -498,7 +612,7 @@ async function verdicts(request, env) {
     const trustedDown = [];
     for (const s of down) {
       const st = JSON.parse((await env.PROBES.get(`slot:${s}`)) || '{}');
-      if ((st.suspicion || 0) < CFG.SLOT_SUSPICION_THRESHOLD) trustedDown.push(s);
+      if (effectiveSuspicion(st) < CFG.SLOT_SUSPICION_THRESHOLD) trustedDown.push(s);
     }
 
     out.push({

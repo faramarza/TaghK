@@ -59,7 +59,7 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 265 checks; PYTHON=<venv>/bin/python if your
+./test/run-all.sh          # 287 checks; PYTHON=<venv>/bin/python if your
                            # system python lacks `cryptography`.
                            # Suites 6 and 7 need nginx and are SKIPPED loudly
                            # without it: apt-get install -y nginx-light
@@ -127,6 +127,41 @@ anything else. Set a calendar reminder for `epochs_of_headroom <= 1`.
 
 Uploading a commitment whose serial is not greater than the stored one is
 refused with 409 — the server will not roll back, and neither will a client.
+
+#### Health, from cron
+
+Two of the failures in this system are silent: an expiring key commitment stops
+enrolment with no error anywhere, and a canary pool nobody has ever reached is
+inert rather than broken. Run this hourly and alert on a non-zero exit.
+
+```bash
+DISTRIBUTOR_URL=… ADMIN_KEY=… COLLECTOR_URL=… COLLECTOR_ADMIN=… \
+  node tools/health-check.mjs        # 0 healthy, 1 warnings, 2 broken now
+```
+
+#### Publishing the commitment for independent checking
+
+The anti-tagging guarantee against a compromised server is cryptographic. The
+guarantee against a **malicious operator** — you — is only that equivocation is
+detectable, and detection requires copies that you do not control.
+
+```bash
+# Publish alongside every mint: the document, its signature, and its hash.
+sha256sum commitment.json
+```
+
+Put a copy somewhere you cannot silently edit — a mirror run by someone else, a
+transparency log, a repository with public history. Then anyone can run:
+
+```bash
+node tools/verify-commitment.mjs --key <COMMITMENT_PK> \
+     https://dist.<you>.workers.dev/api/keys https://<mirror>/keys.json
+```
+
+Exit code 2 means the same serial was published as two different documents.
+See `docs/VERIFY.md` for the user-facing version, and `docs/VERIFY.fa.md` for
+the Persian draft — **which must be reviewed by a native speaker before it is
+published to anyone.**
 
 **All three secrets are required.** The Worker refuses the operator API
 outright when `ADMIN_KEY` is absent rather than falling back to anything, so a

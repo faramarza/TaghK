@@ -221,6 +221,32 @@ try {
   eq((await post('/probe/report', { token: hostile[2], results: [{ ref: 'n-aaa', tcp: false }] })).status, 200,
     'reports are accepted; judgement happens at verdict time, not by refusing data');
 
+  section('2.11 — an unreachable canary can never accuse anyone');
+  {
+    const health = await (await admin('/admin/canary-health', null, 'GET')).json();
+    eq(health.required_slots, 2, 'a canary host must be reached by two distinct slots to count');
+    check(health.pending > 0, `${health.pending} hosts are still unvalidated and therefore inert`,
+      'a host blocked in-country simply never scores, instead of accusing every honest probe');
+    // Slot ids are randHex(8) — sixteen hex characters. Field names like
+    // `required_slots` are counts; what must never appear is an identifier.
+    check(!/[0-9a-f]{16}/.test(JSON.stringify(health)),
+      'canary health exposes hosts and counts, never a slot identifier');
+
+    // A lie about an unvalidated host must score nothing, however corroborated.
+    const fresh = (await (await post('/probe/enrol', { code: codes[6] })).json()).tokens;
+    const m = JSON.parse((await (await post('/probe/manifest', { token: fresh[0] })).json()).manifest);
+    const decoys = m.targets.filter((t) => !realHosts.has(t.host));
+    for (let i = 1; i <= 4; i++) {
+      await post('/probe/report', { token: fresh[i],
+        results: decoys.map((c) => ({ ref: c.ref, tcp: false })) });
+    }
+    const after = await (await post('/probe/manifest', { token: fresh[6] })).json();
+    const shape = JSON.parse(after.manifest).targets;
+    check(shape.filter((t) => realHosts.has(t.host)).length > 1,
+      'four rounds of lying about unvalidated hosts did not demote the slot',
+      'nothing corroborated them, so nothing counted');
+  }
+
   section('quorum and verdicts');
 
   const v = await (await admin('/admin/verdicts', null, 'GET')).json();

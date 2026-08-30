@@ -24,6 +24,9 @@
     "build:canary-pool": "node tools/build-canary-pool.mjs",
     "test:node-config": "./test/bootstrap-config.test.sh",
     "test:integration": "./test/integration/run.sh",
-    "test:anchor": "node test/anchor.test.mjs"
+    "test:anchor": "node test/anchor.test.mjs",
+    "health": "node tools/health-check.mjs",
+    "verify:commitment": "node tools/verify-commitment.mjs",
+    "mint:commitment": "node tools/mint-commitment.mjs"
   }
 }

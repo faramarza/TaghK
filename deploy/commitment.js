@@ -222,3 +222,84 @@ export function buildCommitment({ serial, prev, keys, issuedAt, notAfter }) {
     issued_at: issuedAt, not_after: notAfter, keys: ordered,
   });
 }
+
+/**
+ * Cross-check a served commitment against independently fetched copies.
+ *
+ * This is the half of the design that addresses a malicious OPERATOR rather
+ * than a compromised server (04-STATUS.md 2.18). Signing cannot stop the key
+ * holder from signing a second, targeted document — nothing cryptographic can.
+ * What it cannot do is make two different documents with the SAME SERIAL agree,
+ * so a client or a researcher comparing copies from independent locations sees
+ * the split.
+ *
+ * Rules, and why each is what it is:
+ *
+ *   same serial, different bytes  -> EQUIVOCATION. Fail closed. There is no
+ *                                    benign reading: the operator signed two
+ *                                    documents and gave them to different
+ *                                    people.
+ *   mirror serial is HIGHER       -> the primary is behind, or has been rolled
+ *                                    back for this client specifically. Both
+ *                                    look the same from here, so raise the
+ *                                    floor to the mirror's serial; the primary
+ *                                    document then fails the rollback check.
+ *   mirror serial is LOWER        -> ordinary lag. Ignore.
+ *   mirror unreachable            -> ignore. A censor can block a mirror, and
+ *                                    treating that as an attack would hand them
+ *                                    an off switch for the whole client.
+ *
+ * @param served      { doc, signature } from the distributor
+ * @param mirrorDocs  array of { doc, signature, source } fetched elsewhere;
+ *                    unreachable mirrors are simply absent
+ */
+export async function crossCheckCommitment(served, mirrorDocs = []) {
+  const out = { equivocation: null, minSerial: 0, compared: 0 };
+  if (!served?.doc) return out;
+
+  let primary;
+  try { primary = JSON.parse(served.doc); } catch { return out; }
+  if (!Number.isSafeInteger(primary?.serial)) return out;
+
+  const primaryHash = await commitmentHash(served.doc);
+  out.minSerial = primary.serial;
+
+  for (const mirror of mirrorDocs) {
+    if (!mirror?.doc) continue;
+    let parsed;
+    try { parsed = JSON.parse(mirror.doc); } catch { continue; }
+    if (!Number.isSafeInteger(parsed?.serial)) continue;
+    out.compared++;
+
+    if (parsed.serial === primary.serial) {
+      const hash = await commitmentHash(mirror.doc);
+      if (hash !== primaryHash) {
+        out.equivocation = {
+          serial: primary.serial,
+          source: mirror.source ?? 'mirror',
+          primary_hash: primaryHash,
+          mirror_hash: hash,
+        };
+      }
+    } else if (parsed.serial > primary.serial) {
+      out.minSerial = Math.max(out.minSerial, parsed.serial);
+    }
+  }
+  return out;
+}
+
+/**
+ * The check a client should run before anchoring, given mirror copies.
+ * Throws on equivocation; otherwise returns the serial floor to enforce.
+ */
+export async function requireAgreement(served, mirrorDocs, storedFloor = 0) {
+  const result = await crossCheckCommitment(served, mirrorDocs);
+  if (result.equivocation) {
+    throw new Error(
+      `commitment: EQUIVOCATION at serial ${result.equivocation.serial} — ` +
+      `${result.equivocation.source} published different bytes. ` +
+      'The operator is handing different keys to different people. Discard these tokens.'
+    );
+  }
+  return Math.max(storedFloor, result.minSerial);
+}

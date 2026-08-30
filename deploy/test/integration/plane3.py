@@ -358,6 +358,34 @@ r = run(["python3", "control-plane.py", "check"], cp_env)
 check("[BURN]" not in r.stdout, "a further control-plane pass burns nothing",
       "a censor feeding false blocks does not get to destroy the fleet")
 
+# ═══════════════════════════════════════════════════════════════════════════
+section("operator health check — the failures that are otherwise silent")
+
+health_env = {"DISTRIBUTOR_URL": DIST, "ADMIN_KEY": ADMIN_KEY,
+              "COLLECTOR_URL": COLL, "COLLECTOR_ADMIN": COLL_ADMIN}
+r = run(["node", "tools/health-check.mjs"], health_env)
+check(r.returncode in (0, 1), "health-check.mjs runs against the live system",
+      f"exit {r.returncode}")
+check("key commitment serial" in r.stdout,
+      "it reports the key commitment and its headroom",
+      next((l.strip() for l in r.stdout.splitlines() if "commitment" in l), ""))
+check("canary" in r.stdout, "and the canary pool state")
+
+# The trap this script exists for: a commitment that no longer covers the
+# current epoch stops enrolment dead, with no error anywhere until someone
+# tries to sign up.
+stats = d("/admin/stats")
+check(stats["key_commitment"]["issuing"] is True,
+      "the live distributor is issuing", 
+      f"headroom {stats['key_commitment']['epochs_of_headroom']} epoch(s)")
+
+r = run(["node", "tools/verify-commitment.mjs", "--key", os.environ["COMMITMENT_PK"],
+         f"{DIST}/api/keys"], {"NODE_EXTRA_CA_CERTS": os.environ["SSL_CERT_FILE"]})
+check(r.returncode == 0, "verify-commitment.mjs validates the published commitment",
+      next((l.strip() for l in r.stdout.splitlines() if "serial" in l), r.stderr[:90]))
+check("sha256" in r.stdout, "and prints a hash anyone can compare against a mirror")
+
+
 print(json.dumps({"failures": failures, "count": count}), file=sys.stderr)
 if failures:
     print(f"\n\033[31m{len(failures)} of {count} checks FAILED\033[0m")

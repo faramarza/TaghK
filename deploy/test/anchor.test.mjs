@@ -18,7 +18,7 @@ import {
   currentEpoch, epochPublicKey, deriveEpochKey, EPOCH_LENGTH_S,
 } from '../voprf.js';
 import { buildCommitment, commitmentHash, anchorEpochKey, NULL_PREV,
-         EPOCH_SECONDS_FOR_BOUNDS } from '../commitment.js';
+         EPOCH_SECONDS_FOR_BOUNDS, crossCheckCommitment, requireAgreement } from '../commitment.js';
 import { commitmentKeypair, sign, mint, anchorFor } from './anchor-helper.mjs';
 
 const master = generateMaster();
@@ -163,6 +163,44 @@ section('no secret material in what is published');
   check(!flat.includes(master), 'the commitment does not contain the VOPRF master');
   check(!flat.includes(deriveEpochKey(master, EPOCH)), 'nor any epoch secret key');
   check(Object.values(doc.keys).every((k) => /^[0-9a-f]{64}$/.test(k)), 'only public points are published');
+}
+
+section('cross-checking against independent copies (2.18)');
+
+{
+  const mirror = { doc: commitment.doc, signature: commitment.signature, source: 'mirror-a' };
+  const agreed = await crossCheckCommitment(commitment, [mirror]);
+  eq(agreed.equivocation, null, 'identical copies agree');
+  eq(agreed.compared, 1, 'the comparison actually happened');
+
+  // The operator signs a second document at the SAME serial for one client.
+  // Signing cannot prevent this; comparison makes it visible.
+  const targeted = await mint({
+    master, pkcs8: operator.pkcs8, span: 2, serial: 4,
+    keys: { [String(EPOCH)]: generateKey().public },
+  });
+  const split = await crossCheckCommitment(commitment,
+    [{ ...targeted, source: 'mirror-a' }]);
+  check(split.equivocation !== null,
+    'two different documents at one serial are detected as equivocation',
+    `serial ${split.equivocation?.serial}`);
+  check(split.equivocation.primary_hash !== split.equivocation.mirror_hash,
+    'and the two hashes are reported so it can be published');
+
+  await throws(() => requireAgreement(commitment, [{ ...targeted, source: 'mirror-a' }]),
+    'requireAgreement() fails closed on equivocation');
+
+  // A mirror that is merely ahead is lag, not an attack — but it raises the
+  // floor, so a rolled-back primary then fails the rollback check.
+  const newer = await mint({ master, pkcs8: operator.pkcs8, span: 2, serial: 9,
+                             prevDoc: commitment.doc });
+  const floor = await requireAgreement(commitment, [{ ...newer, source: 'mirror-a' }]);
+  eq(floor, 9, 'a mirror ahead of the server raises the client’s serial floor');
+  await throws(() => anchorEpochKey(EPOCH, served(), trust({ minSerial: floor })),
+    'so the older document the server offered is then refused');
+
+  const offline = await requireAgreement(commitment, []);
+  eq(offline, 4, 'an unreachable mirror is not treated as an attack');
 }
 
 summary();

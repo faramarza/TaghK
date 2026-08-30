@@ -79,6 +79,8 @@
  *   DO      LEDGER        spent tokens, single-use PoW  — STRONGLY CONSISTENT
  *   DO      RATE_LIMITER  request counters              — STRONGLY CONSISTENT
  *   DO      ATTRIBUTION   reverse index, suspicion      — STRONGLY CONSISTENT
+ *   DO      REGISTRY      inventory, fallbacks, commitment — STRONGLY CONSISTENT
+ *                        (authority; KV holds a mirror for the read path)
  *   Secret  ADMIN_KEY  operator API auth
  *   Secret  KEY_SALT   hashing pepper — SEPARATE from ADMIN_KEY so that
  *                      rotating the admin key does not invalidate every hash
@@ -97,10 +99,10 @@
 import { issue, verifyToken as voprfVerify, spendKey, timingSafeEqual,
          currentEpoch, deriveEpochKey, EPOCH_LENGTH_S } from './voprf.js';
 import { claimOnce, overLimit, implicateLineage, drainImplicated,
-         bumpSuspicion, readSuspicion } from './durable.js';
+         bumpSuspicion, readSuspicion, registry } from './durable.js';
 
 // Durable Object classes must be exported from the Worker entry point.
-export { Ledger, RateLimiter, Attribution } from './durable.js';
+export { Ledger, RateLimiter, Attribution, Registry } from './durable.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -250,6 +252,16 @@ async function rateLimited(request, env, bucket, max) {
   return overLimit(env.RATE_LIMITER, key, max, CFG.RATE_WINDOW_S);
 }
 
+/**
+ * Write the authoritative inventory back to KV, which is what the subscription
+ * path reads. Mirrored from the value the Registry returned, never from what
+ * this request thought it was writing.
+ */
+async function mirrorInventory(env, inventory) {
+  await env.NODES.put('inventory', JSON.stringify(inventory));
+  return inventory;
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Key commitment — served, never signed here
 // ───────────────────────────────────────────────────────────────────────────
@@ -310,12 +322,15 @@ async function adminCommitment(request, env) {
     return json({ error: 'invalid' }, 400);
   }
 
-  const existing = await commitmentState(env);
-  if (existing && parsed.serial <= existing.serial) {
-    return json({ error: 'stale', have: existing.serial, offered: parsed.serial }, 409);
-  }
+  // Compare-and-set in the Registry, not a read-then-write on KV. The published
+  // history must only move forwards: a client that has accepted serial N
+  // refuses anything lower, so serving an older document after a race would
+  // lock those clients out and look like equivocation to anyone comparing.
+  const record = { doc: body.doc, signature: body.signature };
+  const result = await registry(env.REGISTRY).setCommitment(record, parsed.serial);
+  if (!result.ok) return json({ error: 'stale', have: result.have, offered: parsed.serial }, 409);
 
-  await env.NODES.put('commitment', JSON.stringify({ doc: body.doc, signature: body.signature }));
+  await env.NODES.put('commitment', JSON.stringify(record));
   return json({ ok: true, ...(await commitmentState(env)) });
 }
 
@@ -747,23 +762,30 @@ const authed = (request, env) =>
 async function adminNodes(request, env) {
   if (!authed(request, env)) return decoy();
 
+  // GET reads the AUTHORITY, not the mirror. An operator inspecting inventory
+  // to decide whether a node is still serving must not be shown a stale copy.
   if (request.method === 'GET') {
-    return json(JSON.parse((await env.NODES.get('inventory')) || '[]'));
+    return json(await registry(env.REGISTRY).inventory());
   }
 
   const incoming = await readJson(request);
   if (!incoming) return decoy();
 
-  const inventory = JSON.parse((await env.NODES.get('inventory')) || '[]');
-  for (const node of [].concat(incoming)) {
+  const nodes = [].concat(incoming);
+  if (!Array.isArray(nodes) || !nodes.length || nodes.length > 512) return decoy();
+  for (const node of nodes) {
+    if (!node || typeof node !== 'object') return decoy();
     node.id ||= randHex(8);
+    if (typeof node.id !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(node.id)) return decoy();
     node.status ||= 'active';
     node.pool = POOLS.includes(node.pool) ? node.pool : 'sacrificial';
     node.added ||= Date.now();
-    const i = inventory.findIndex((n) => n.id === node.id);
-    i >= 0 ? (inventory[i] = node) : inventory.push(node);
   }
-  await env.NODES.put('inventory', JSON.stringify(inventory));
+
+  // Serialised in the Registry. The KV version was a read-then-write, so an
+  // operator edit racing the automated burn handler could silently un-block a
+  // node that had just been burned — and that node keeps being handed to users.
+  const inventory = await mirrorInventory(env, await registry(env.REGISTRY).upsertNodes(nodes));
   return json({ ok: true, count: inventory.length });
 }
 
@@ -783,16 +805,14 @@ async function adminReportBlocked(request, env, ctx) {
   const nodeId = body?.node_id;
   if (typeof nodeId !== 'string') return decoy();
 
-  const inventory = JSON.parse((await env.NODES.get('inventory')) || '[]');
-  const node = inventory.find((n) => n.id === nodeId);
-  if (!node) return json({ error: 'unknown' }, 404);
-
-  node.status = 'blocked';
-  node.blocked_at = Date.now();
-  await env.NODES.put('inventory', JSON.stringify(inventory));
+  // Marked blocked inside the Registry so a concurrent operator edit cannot
+  // overwrite the burn with a stale copy of the inventory.
+  const marked = await registry(env.REGISTRY).markBlocked(nodeId);
+  if (!marked.ok) return json({ error: 'unknown' }, 404);
+  await mirrorInventory(env, marked.inventory);
 
   // A burned PROTECTED node is far more incriminating — few lineages reach it.
-  const weight = { sacrificial: 0.5, standard: 1.0, protected: 2.5 }[node.pool] ?? 1.0;
+  const weight = { sacrificial: 0.5, standard: 1.0, protected: 2.5 }[marked.pool] ?? 1.0;
 
   // Read and clear in one indivisible step, so two burns of the same node
   // cannot count the same lineage twice.
@@ -831,13 +851,14 @@ async function adminFallbacks(request, env) {
   }
   const list = await readJson(request);
   if (!Array.isArray(list)) return decoy();
-  await env.NODES.put('fallbacks', JSON.stringify(list.slice(0, 32)));
-  return json({ ok: true, count: list.length });
+  const stored = await registry(env.REGISTRY).setFallbacks(list.slice(0, 32));
+  await env.NODES.put('fallbacks', JSON.stringify(stored));
+  return json({ ok: true, count: stored.length });
 }
 
 async function adminStats(request, env) {
   if (!authed(request, env)) return decoy();
-  const inventory = JSON.parse((await env.NODES.get('inventory')) || '[]');
+  const inventory = await registry(env.REGISTRY).inventory();
   const commitment = await commitmentState(env);
   const epoch = currentEpoch();
   return json({

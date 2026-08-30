@@ -45,6 +45,12 @@ class_name = "RateLimiter"
 name = "ATTRIBUTION"
 class_name = "Attribution"
 
+# Operator-mutable state: node inventory, fallbacks, the stored key commitment.
+# A single unsharded instance so operator writes are totally ordered (2.8).
+[[durable_objects.bindings]]
+name = "REGISTRY"
+class_name = "Registry"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Ledger", "RateLimiter"]
@@ -52,6 +58,10 @@ new_sqlite_classes = ["Ledger", "RateLimiter"]
 [[migrations]]
 tag = "v2"
 new_sqlite_classes = ["Attribution"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["Registry"]
 
 [observability]
 enabled = false               # no logs, architecturally — not as policy

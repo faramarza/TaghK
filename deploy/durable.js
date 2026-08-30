@@ -227,6 +227,81 @@ export class Attribution extends Pruned {
   }
 }
 
+/**
+ * Registry — operator-mutable state that must not be clobbered.
+ *
+ * Node inventory, fallbacks, and the stored key commitment were each a
+ * read-then-write on KV (04-STATUS.md 2.8). Two operators acting at once — or
+ * one operator racing the automated burn handler, which is the realistic case
+ * since control-plane.py marks nodes blocked without a human — could each read
+ * the list without the other's change and one write would be lost. A node
+ * silently un-blocked by a concurrent edit is a node still being handed to
+ * users after it was burned.
+ *
+ * A SINGLE, UNSHARDED instance. Operator writes are rare and must be totally
+ * ordered with respect to each other; sharding would only reintroduce the
+ * problem it exists to solve. Reads stay on KV — the subscription path polls
+ * hourly from every client and must not wait on this.
+ *
+ * The DO holds the authority; KV holds a mirror for the read path. If a mirror
+ * write fails the two diverge until the next mutation, so every mutating helper
+ * rewrites the mirror from the value the DO returned rather than from its own
+ * idea of what it just wrote.
+ */
+export class Registry extends DurableObject {
+  async #inventory() { return (await this.ctx.storage.get('inventory')) || []; }
+
+  /** Merge nodes in, preserving fields the caller did not send. */
+  async upsertNodes(incoming) {
+    const inv = await this.#inventory();
+    for (const node of incoming) {
+      const i = inv.findIndex((n) => n.id === node.id);
+      if (i >= 0) inv[i] = { ...inv[i], ...node };
+      else inv.push(node);
+    }
+    await this.ctx.storage.put('inventory', inv);
+    return inv;
+  }
+
+  async markBlocked(nodeId) {
+    const inv = await this.#inventory();
+    const node = inv.find((n) => n.id === nodeId);
+    if (!node) return { ok: false, inventory: inv };
+    node.status = 'blocked';
+    node.blocked_at = Date.now();
+    await this.ctx.storage.put('inventory', inv);
+    return { ok: true, pool: node.pool, inventory: inv };
+  }
+
+  async inventory() { return this.#inventory(); }
+
+  async setFallbacks(list) {
+    await this.ctx.storage.put('fallbacks', list);
+    return list;
+  }
+
+  /**
+   * Compare-and-set on the serial. The published history must only move
+   * forwards: a client that has seen serial N refuses anything lower, so
+   * serving an older document after a race would lock those clients out while
+   * looking like an equivocation attempt to anyone comparing.
+   */
+  async setCommitment(record, serial) {
+    const current = await this.ctx.storage.get('commitment_serial');
+    if (current !== undefined && serial <= current) return { ok: false, have: current };
+    await this.ctx.storage.put('commitment_serial', serial);
+    await this.ctx.storage.put('commitment', record);
+    return { ok: true, serial };
+  }
+
+  async commitment() {
+    return {
+      record: (await this.ctx.storage.get('commitment')) ?? null,
+      serial: (await this.ctx.storage.get('commitment_serial')) ?? null,
+    };
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Worker-side helpers. Every one FAILS CLOSED: if the Durable Object is
 // unreachable we deny rather than allow. An availability blip must never
@@ -284,3 +359,13 @@ export async function readSuspicion(ns, lineage) {
   const key = `sus:${lineage}`;
   try { return await stub(ns, key).total(key); } catch { return null; }
 }
+
+/**
+ * The registry is a single named object, not a shard. Operator mutations must
+ * be totally ordered with respect to one another.
+ *
+ * These throw rather than returning a sentinel: they are operator-facing, and a
+ * silent no-op on an inventory write is how a burned node stays in service. The
+ * caller turns a throw into the standard decoy, so nothing leaks either way.
+ */
+export const registry = (ns) => ns.get(ns.idFromName('registry'));
