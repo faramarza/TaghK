@@ -271,13 +271,19 @@ def http_json(url: str, payload: dict | None = None, timeout: int = 25) -> dict 
         return None
 
 
-def fetch_manifest(collector: str, token: dict[str, str] | None) -> list[Target] | None:
+def fetch_manifest(
+    collector: str, token: dict[str, str] | None
+) -> tuple[list[Target], list[dict]] | None:
     """
-    Fetch and VERIFY a signed work manifest.
+    Fetch and VERIFY a signed work manifest. Returns (targets, fresh_tokens).
 
     The signature check is the security boundary of this whole component. Without
     it, anyone who can answer the agent's request chooses what the volunteer's
     device connects to.
+
+    The fresh tokens ride along so the agent never has to re-enrol. They MUST be
+    kept: every collector call spends exactly one token, so the report that
+    follows this manifest needs one of its own.
     """
     body = {"token": token} if token else {}
     resp = http_json(f"{collector}/probe/manifest", body)
@@ -316,7 +322,7 @@ def fetch_manifest(collector: str, token: dict[str, str] | None) -> list[Target]
                sni=t.get("sni"), kind=t.get("kind", "node"))
         for t in parsed.get("targets", [])[:MAX_TARGETS]
     ]
-    return targets
+    return targets, resp.get("tokens") or []
 
 
 def submit(collector: str, results: list[dict], token: dict[str, str] | None) -> dict | None:
@@ -364,18 +370,34 @@ def run(collector: str, tokens: list[dict]) -> None:
     print("    Ctrl-C to stop. Kill the process and no trace remains.\n")
 
     while True:
-        token = tokens.pop() if tokens else None
-        if token is None:
+        if not tokens:
             print("[!] out of tokens — re-enrol to continue", file=sys.stderr)
             return
 
-        targets = fetch_manifest(collector, token)
-        if not targets:
+        # ONE TOKEN PER COLLECTOR CALL. The manifest fetch and the report are
+        # two calls and need two tokens.
+        #
+        # This used to reuse a single token for both. The collector's spend
+        # check was a read-then-write against eventually consistent storage, so
+        # the second use usually landed before the first had propagated and was
+        # waved through. Once that check became exactly-once the reuse was
+        # correctly refused and EVERY report silently failed — the probe network
+        # would have measured faithfully and reported nothing, and the only
+        # symptom would have been verdicts that never reached quorum. See
+        # 04-STATUS.md 2.13.
+        manifest = fetch_manifest(collector, tokens.pop())
+        if not manifest:
             print("[~] no valid manifest; will retry")
         else:
+            targets, fresh = manifest
+            tokens.extend(fresh)         # rolling re-issue rides on the manifest
             results = [measure(t) for t in targets]
             up = sum(1 for r in results if r.get("tcp"))
-            resp = submit(collector, results, token)
+
+            if not tokens:
+                print("[!] out of tokens — re-enrol to continue", file=sys.stderr)
+                return
+            resp = submit(collector, results, tokens.pop())
             status = "accepted" if resp and resp.get("ok") else "not accepted"
             print(f"[{time.strftime('%H:%M:%S')}] probed {len(results)} targets, "
                   f"{up} reachable — report {status}")

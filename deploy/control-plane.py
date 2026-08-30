@@ -150,6 +150,29 @@ def handle_burn(node: dict[str, Any]) -> None:
     print(f"         attribution: {result.get('implicated', 0)} lineages implicated "
           f"(weight {result.get('weight')}) — demoted, never banned")
 
+    # Retire the measurement target too.
+    #
+    # Without this the collector keeps handing the burned node to probes, so
+    # volunteers inside the country go on connecting to an address the censor
+    # has just demonstrated it is watching — indefinitely, since this process
+    # stops evaluating the node the moment the distributor marks it blocked and
+    # nothing else ever revisits it. Burning a node must stop pointing people at
+    # it, in both planes.
+    try:
+        targets = coll("/admin/targets")
+        retired = False
+        for t in targets:
+            if t.get("node_id") == nid and t.get("status") == "active":
+                t["status"] = "retired"
+                retired = True
+        if retired:
+            coll("/admin/targets", "POST", targets)
+            print("         measurement target retired — probes stop connecting to it")
+    except Exception as exc:
+        print(f"         [!] could not retire the measurement target: {exc}\n"
+              f"             DO THIS BY HAND — probes are still being sent to {nid}",
+              file=sys.stderr)
+
     if PROVISION_CMD:
         print("         provisioning replacement on a different ASN…")
         subprocess.run(PROVISION_CMD, shell=True, check=False)

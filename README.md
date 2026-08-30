@@ -44,7 +44,7 @@ Everything here serves those three.
 | `deploy/durable.js` | Strongly consistent primitives. Token spend records, single-use proof-of-work, probe nonces, rate limiters. These cannot live in KV — see `docs/adr/0001`. |
 | `deploy/canary.js`, `deploy/canary-pool.js` | Canary selection and the generated 246-host bootstrap pool. |
 | `deploy/selftest.mjs` | Cryptographic self-test. **Run before every deployment.** |
-| `deploy/test/` | 135 checks. Both Workers driven through their real APIs in the real Workers runtime, with adversarial cases throughout. |
+| `deploy/test/` | 206 checks across seven suites. Both Workers driven through their real APIs in the real Workers runtime; the node's generated configs parsed and served; and the burn → attribution → replacement → self-heal loop run end to end with real processes. |
 | `docs/adr/` | Architecture decision records, including the escalated Cloudflare terms-of-service question. |
 | `deploy/wrangler*.toml`, `package.json` | Deployment config and key generation scripts. |
 
@@ -71,13 +71,16 @@ than everything else here combined.
 ```bash
 cd deploy && npm install
 node selftest.mjs        # cryptography only, two seconds
-./test/run-all.sh        # everything, about two minutes
+./test/run-all.sh        # everything, about three minutes
 ```
 
 `run-all.sh` runs both Workers in the real Workers runtime and drives them
-through the real API — issuance, redemption, concurrency, and the failure paths.
-If your system Python lacks the `cryptography` package, pass an interpreter that
-has one: `PYTHON=/path/to/venv/bin/python ./test/run-all.sh`.
+through the real API — issuance, redemption, concurrency, and the failure paths
+— then stands up the whole measurement plane and burns a node to confirm a
+client heals without touching anything. If your system Python lacks the
+`cryptography` package, pass an interpreter that has one:
+`PYTHON=/path/to/venv/bin/python ./test/run-all.sh`. The last two suites need
+`nginx` and are skipped with a notice if it is missing.
 
 Crypto that does not work is worse than no crypto, because it looks like
 protection. In particular, an unverified DLEQ proof silently forfeits all

@@ -12,20 +12,39 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PYTHON="${PYTHON:-python3}"
 
-echo "═══ 1/5  cryptographic self-test (voprf.js)"
+echo "═══ 1/7  cryptographic self-test (voprf.js)"
 node selftest.mjs
 
-echo; echo "═══ 2/5  KV eventual-consistency regression (04-STATUS 2.1, 2.2)"
+echo; echo "═══ 2/7  KV eventual-consistency regression (04-STATUS 2.1, 2.2)"
 node test/kv-race.test.mjs
 
-echo; echo "═══ 3/5  canary pool invariants (04-STATUS 2.5)"
+echo; echo "═══ 3/7  canary pool invariants (04-STATUS 2.5)"
 node test/canary.test.mjs
 
-echo; echo "═══ 4/5  distributor in workerd — exactly-once, rate limits, adversarial"
+echo; echo "═══ 4/7  distributor in workerd — exactly-once, rate limits, adversarial"
 node test/distributor.test.mjs 2>&1 | tr -d "\000" | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
 
-echo; echo "═══ 5/5  collector in workerd + independent Ed25519 verification (04-STATUS 2.3)"
+echo; echo "═══ 5/7  collector in workerd + independent Ed25519 verification (04-STATUS 2.3)"
 node test/collector.test.mjs 2>&1 | tr -d "\000" | grep -vE "wrangler:(info|warn)|Request was cancelled|^\s+at |undici|node:internal|^\(node:|DeprecationWarning|^Your Worker|^Binding|^env\.|^⎔|^\s*$"
 "$PYTHON" test/verify-manifest.py
+
+# The last two need nginx (a real TLS terminator and a real HTTP server). Skip
+# with a loud notice rather than a silent pass if it is not installed — a
+# skipped security test that looks like a passing one is how things ship broken.
+if ! command -v nginx >/dev/null; then
+  echo; echo "═══ 6/7, 7/7  SKIPPED — nginx not installed"
+  echo "    The node-config and Plane 3 integration suites need it:"
+  echo "      apt-get install -y nginx-light   (or your platform's equivalent)"
+  echo; echo "═══ suites 1-5 passed; 6 and 7 did not run"
+  exit 0
+fi
+
+export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1}" no_proxy="${no_proxy:-localhost,127.0.0.1}"
+
+echo; echo "═══ 6/7  node configuration from bootstrap.sh, parsed and served"
+./test/bootstrap-config.test.sh
+
+echo; echo "═══ 7/7  Plane 3 end to end — burn, attribution, replacement, self-heal"
+./test/integration/run.sh
 
 echo; echo "═══ all suites passed"

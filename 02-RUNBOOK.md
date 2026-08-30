@@ -59,8 +59,10 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 135 checks; PYTHON=<venv>/bin/python if your
-                           # system python lacks `cryptography`
+./test/run-all.sh          # 206 checks; PYTHON=<venv>/bin/python if your
+                           # system python lacks `cryptography`.
+                           # Suites 6 and 7 need nginx and are SKIPPED loudly
+                           # without it: apt-get install -y nginx-light
 ```
 
 ```bash
@@ -209,7 +211,16 @@ answers you directly.
 **This is normal and expected.** Nodes are consumables.
 
 1. Control plane handles it automatically: marks blocked → runs leak attribution →
-   provisions a replacement → clients self-heal on next poll.
+   **retires the measurement target** → provisions a replacement → clients
+   self-heal on next poll. This whole chain is exercised by
+   `npm run test:integration`; if you change any part of it, run that first.
+
+   The target retirement matters as much as the rest: without it the collector
+   keeps handing the burned node to probes, and volunteers inside the country go
+   on connecting to an address the censor has just shown it is watching. If the
+   control plane prints `[!] could not retire the measurement target`, do it by
+   hand immediately — `POST /admin/targets` with that node's entry set to
+   `"status": "retired"`.
 2. **Destroy the burned instance.** Do not repair, do not reuse the IP. Once
    blocklisted, an address is gone permanently.
 3. Provision the replacement **on a different ASN** — same provider means likely the
@@ -218,6 +229,19 @@ answers you directly.
    pool logic will demote them automatically. Do not intervene manually; do not ban.
 
 **Response target:** replacement live within 2 hours. Users take no action.
+
+**What to expect in the log.** Three consecutive `check` rounds before anything
+happens — the strike counter absorbs transient outages, and without it a brief
+disruption destroys the fleet:
+
+```
+[-] node0001 203.0.113.10: blocked from 2 slots — strike 1/3
+[-] node0001 203.0.113.10: blocked from 2 slots — strike 2/3
+[BURN] node0001 (203.0.113.10) — quorum of in-country probes confirms blocked
+       attribution: 1 lineages implicated (weight 0.5) — demoted, never banned
+       measurement target retired — probes stop connecting to it
+       provisioning replacement on a different ASN…
+```
 
 ### 4.2 TCP connects but TLS fails
 

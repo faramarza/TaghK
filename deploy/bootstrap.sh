@@ -269,7 +269,11 @@ server {
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
+        # Deliberately NOT forwarding X-Real-IP or X-Forwarded-For. Xray has no
+        # use for them, and on a direct (non-CDN) connection \$remote_addr is a
+        # user's address. Logging is off today, so nothing records it — but a
+        # header that carries a user address into another process is one config
+        # change away from being a record, and there is no reason to carry it.
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
     }

@@ -22,18 +22,23 @@ bootstrapped, and there is still no client.
 | `distributor-worker.js` | **Tested in workerd, never deployed** | 37 checks: full issuance flow, concurrency, rate limits, 14 adversarial cases. Has never run on Cloudflare's edge or handled a real user. |
 | `collector-worker.js` | **Tested in workerd, never deployed** | 37 checks incl. Ed25519 signing, cross-verified by two independent implementations. Never deployed. |
 | `01/02/03` docs | **Complete** | Design work, not code. |
-| `bootstrap.sh` | **Never executed** | Syntax-checked only. Never run on a real VPS. |
-| `control-plane.py` | **Never executed** | Compiles. Never talked to a live endpoint. |
-| `probe-agent.py` (main loop) | **Never executed** | Only the crypto path is tested. |
-| `client-singbox.json` | **Never loaded** | A template. sing-box has never parsed it. |
+| `bootstrap.sh` | **Configs executed; script never run** | shellcheck clean. The Xray and nginx configs it generates are parsed, asserted against 03-SECURITY §3.4, and **served** — camouflage page, 404-on-scan, and WebSocket upgrade all verified over real HTTP. The script itself still needs a real VPS: package installs, systemd, sysctl, ufw, fail2ban and SSH hardening are all unverified. |
+| `control-plane.py` | **Executed** | Drives a real distributor and collector over real HTTPS with full certificate validation. The whole burn -> attribution -> replacement -> self-heal loop runs. Found defect 2.14. |
+| `probe-agent.py` (main loop) | **Executed** | Runs as a real subprocess against a real collector: enrols, verifies a real Ed25519 manifest, measures, reports. Found defect 2.13. |
+| `client-singbox.json` | **Never loaded** | A template. sing-box has never parsed it — no sing-box binary is reachable from the build environment. |
 
-**Rough completion: architecture ~85%, backend code ~55%, client ~5%,
-operations ~0%.**
+**Rough completion: architecture ~85%, backend code ~65%, client ~5%,
+operations ~5%.**
 
-The backend figure moved because the defects that made it unshippable are
-closed and it is now executed rather than assumed. It did not move further
-because "runs correctly in a local runtime" and "serves people in Tehran" are
-separated by a deployment, a fleet, a client, and a probe network.
+The backend figure moved again because Plane 3 — the measurement and
+burn-response loop — now runs end to end with real processes instead of being
+a set of components that had each been reasoned about separately. Two defects
+that only appear when the parts are wired together were found that way, and one
+of them would have silently disabled the entire probe network.
+
+It did not move further because "runs correctly against a local runtime" and
+"serves people in Tehran" are still separated by a deployment, a fleet, a
+client, and volunteers.
 
 ---
 
@@ -162,6 +167,59 @@ lost as a side effect of a change made for a different reason. It was introduced
 and closed inside one phase; the lesson is that the diff needs reading against
 I1 every time, not that the process worked.*
 
+#### 2.13 The probe agent spent one token on two calls — *new, closed, was silent*
+
+Found by running `probe-agent.py` against a real collector for the first time.
+
+`run()` popped one token and used it for BOTH `/probe/manifest` and
+`/probe/report`. Probe tokens are single-use. Every report the agent ever
+submitted was refused.
+
+**It did not fail before because defect 2.1 was hiding it.** The collector's
+spend check was a read-then-write against eventually consistent storage, so the
+second use landed a second later, usually before the first had propagated, and
+was waved through. Closing 2.1 made the collector correct and the agent's bug
+visible — which is the good outcome, but note what the failure would have looked
+like in production: **volunteers inside Iran measuring faithfully, reporting
+nothing, and no verdict ever reaching quorum.** No error, no alert; the fleet
+would simply never learn that anything was blocked.
+
+**Closed:** `fetch_manifest()` now returns the fresh tokens the collector
+already sends for exactly this purpose (they were being discarded), and the
+agent spends one token per call. Each cycle spends 2 and receives 4, so the
+supply is self-sustaining.
+
+*The lesson is about testing, not about tokens. Both components were "correct"
+in isolation. The defect lived only in the seam, and nothing but running them
+together was ever going to find it.*
+
+#### 2.14 A burned node stayed in the probe manifest forever — *new, closed*
+
+`handle_burn()` told the distributor a node was blocked and ran
+`PROVISION_CMD`, but never told the collector. The collector kept issuing the
+dead node in work manifests, so **probes inside the country went on connecting
+to an address the censor had just demonstrated it was watching** — indefinitely,
+because the control plane stops evaluating a node the moment it is marked
+blocked, and nothing else ever revisits it.
+
+Wasted probe capacity is the least of it. The exposure is a volunteer's device
+repeatedly contacting a burned endpoint.
+
+**Closed:** `handle_burn()` retires the collector target as well, and says so in
+its output. If that call fails it prints an explicit instruction to do it by
+hand rather than continuing quietly.
+
+#### 2.16 The node forwarded a client address into Xray — *new, closed*
+
+`bootstrap.sh` set `proxy_set_header X-Real-IP $remote_addr` on the WebSocket
+location. Xray has no use for it. Behind the CDN it carries the edge's address,
+but on a direct connection it is a user's.
+
+Nothing recorded it — Xray logging is off — so this was a latent risk rather
+than a live leak, and it is described at that severity. It was also one config
+change away from being a record, for no benefit. **Closed:** removed, with a
+test asserting no client-address header is forwarded.
+
 ### ESCALATED — needs a human decision
 
 #### 2.4 Cloudflare Terms of Service — *researched; decision outstanding*
@@ -226,6 +284,24 @@ honest probes before their reports are allowed to influence anything, and the
 operator pool needs populating before decoys stop being separable from real
 nodes by address shape. Both are P5 prerequisites and are listed in ADR-0003.
 
+#### 2.15 The subscription URL is built from the request's own origin — *low, open*
+
+`getCredentials()` returns `subscription: ${new URL(request.url).origin}/sub/…`.
+Behind anything that terminates TLS and forwards over HTTP — which is what Tier
+A is — the origin the Worker sees is not the origin the client used. In the
+integration harness the client is handed `http://127.0.0.1/sub/…`: wrong scheme,
+missing port.
+
+On Cloudflare `request.url` does reflect the public URL, so this is probably
+inert in the intended deployment. It is recorded because it is invisible until
+a fronting layer changes, the value is derived from an attacker-settable `Host`
+header, and the client that will consume it does not exist yet (P2).
+
+**Recommended fix:** serve a configured public origin, or have the client
+construct `<base>/sub/<lineage>` itself and ignore the field. Decide before the
+client is written, not after.
+
+
 ---
 
 ## 3. Not built at all
@@ -285,16 +361,31 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Partly addressed. `deploy/test/` now runs 135 checks across five suites: the
-cryptographic self-test, a regression harness that models KV's eventual
-consistency, canary pool invariants, and both Workers driven through their real
-APIs in the real Workers runtime with adversarial cases throughout.
+Largely addressed. `deploy/test/` runs **206 checks across seven suites**:
 
-Still absent: load tests, chaos testing, and any end-to-end run of
-burn → attribution → replacement → client self-heal. **The recovery path has
-still never been exercised, and an untested recovery path is a broken one.**
-That loop needs a deployed fleet and a client, so it is gated on P1 and P3
-rather than on more test-writing.
+| Suite | What it runs |
+|---|---|
+| `selftest.mjs` | the VOPRF core |
+| `kv-race` | a model of KV's eventual consistency; asserts the legacy pattern still fails |
+| `canary` | pool invariants |
+| `distributor` | the Worker in workerd, driven through its real API |
+| `collector` | the Worker in workerd + Ed25519 cross-verified by two independent implementations |
+| `bootstrap-config` | the Xray and nginx configs `bootstrap.sh` generates, parsed and **served** over real HTTP |
+| `integration` | **burn → attribution → replacement → client self-heal**, with real processes |
+
+The recovery path is no longer untested. The integration suite stands up both
+Workers in workerd behind a real nginx TLS terminator, runs `control-plane.py`
+and `probe-agent.py` as real subprocesses over HTTPS with full certificate
+validation, drives a real client through VOPRF with mandatory DLEQ, and then:
+strikes → burn → attribution → `PROVISION_CMD` → target retirement → the same
+client self-heals onto a replacement with no user action. It also enrols a
+deliberately hostile probe and confirms it is detected, demoted to a
+canary-heavy manifest, and destroys no healthy node.
+
+Still absent: load tests, chaos testing, and anything involving real network
+conditions. The two vantage points are simulated with an open and a closed
+local port — every other byte crosses a real socket, but nothing here has met a
+censor, a mobile carrier, or a node in another country.
 
 ### 3.8 Operations
 

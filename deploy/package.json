@@ -21,6 +21,8 @@
     "test:canary": "node test/canary.test.mjs",
     "test:distributor": "node test/distributor.test.mjs",
     "test:collector": "node test/collector.test.mjs",
-    "build:canary-pool": "node tools/build-canary-pool.mjs"
+    "build:canary-pool": "node tools/build-canary-pool.mjs",
+    "test:node-config": "./test/bootstrap-config.test.sh",
+    "test:integration": "./test/integration/run.sh"
   }
 }
