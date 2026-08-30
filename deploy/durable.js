@@ -171,6 +171,62 @@ export class RateLimiter extends Pruned {
   }
 }
 
+/**
+ * Attribution — the reverse index and suspicion counters.
+ *
+ * Both were read-modify-write on KV (04-STATUS.md 2.8). A lost append to the
+ * reverse index means a lineage that held a burned node is never implicated at
+ * all: it escapes attribution entirely, silently, and the censor is exactly the
+ * lineage that holds the most burned nodes and therefore the one most likely to
+ * be dropped. A lost suspicion increment is milder — it under-counts, which at
+ * least fails in the direction that does not punish an innocent person (I3).
+ *
+ * Deliberately NOT holding the lineage blob itself. That is read on every
+ * subscription poll, hourly, by every client on a bad connection in a censored
+ * country; it stays on edge-cached KV. Only the two values that are written
+ * concurrently live here, and the credential path (infrequent, and already
+ * talking to a Durable Object to claim its token) refreshes the KV copy.
+ */
+export class Attribution extends Pruned {
+  /** Record that a lineage was given a node. Idempotent. */
+  async implicate(key, lineage, ttlS, cap) {
+    const now = Date.now();
+    const row = await this.ctx.storage.get(key);
+    const set = row && row.e > now ? row.v : [];
+    if (set.includes(lineage)) return true;
+    // Bounded: a popular node is held by many lineages, and an unbounded array
+    // is a storage bug that an adversary can drive by enrolling repeatedly.
+    // Past this point attribution is statistically saturated anyway.
+    if (set.length >= cap) return false;
+    set.push(lineage);
+    await this.ctx.storage.put(key, { v: set, e: now + ttlS * 1000 });
+    await this.ensurePrune();
+    return true;
+  }
+
+  /** Read and clear in one indivisible step, so a burn cannot double-count. */
+  async drain(key) {
+    const row = await this.ctx.storage.get(key);
+    await this.ctx.storage.delete(key);
+    return row && row.e > Date.now() ? row.v : [];
+  }
+
+  /** Atomic add. Returns the new total. */
+  async bump(key, weight, ttlS) {
+    const now = Date.now();
+    const row = await this.ctx.storage.get(key);
+    const total = (row && row.e > now ? row.v : 0) + weight;
+    await this.ctx.storage.put(key, { v: total, e: now + ttlS * 1000 });
+    await this.ensurePrune();
+    return total;
+  }
+
+  async total(key) {
+    const row = await this.ctx.storage.get(key);
+    return row && row.e > Date.now() ? row.v : 0;
+  }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // Worker-side helpers. Every one FAILS CLOSED: if the Durable Object is
 // unreachable we deny rather than allow. An availability blip must never
@@ -200,4 +256,31 @@ export async function ledgerPeek(ns, key) {
 /** true when the caller is OVER the limit. Denies (limits) on any error. */
 export async function overLimit(ns, key, limit, windowS) {
   try { return (await stub(ns, key).incr(key, limit, windowS)).limited; } catch { return true; }
+}
+
+// Attribution helpers. These fail OPEN rather than closed, and the asymmetry is
+// deliberate: refusing to issue credentials because a bookkeeping object is
+// briefly unreachable would deny access to real people under a hostile
+// government in order to protect a reputation score. Losing an attribution
+// record costs the operator some certainty about who is leaking. Losing access
+// costs a user their connection. The second is worse (I3).
+
+export async function implicateLineage(ns, node, lineage, ttlS, cap) {
+  const key = `idx:${node}`;
+  try { return await stub(ns, key).implicate(key, lineage, ttlS, cap); } catch { return false; }
+}
+
+export async function drainImplicated(ns, node) {
+  const key = `idx:${node}`;
+  try { return await stub(ns, key).drain(key); } catch { return []; }
+}
+
+export async function bumpSuspicion(ns, lineage, weight, ttlS) {
+  const key = `sus:${lineage}`;
+  try { return await stub(ns, key).bump(key, weight, ttlS); } catch { return null; }
+}
+
+export async function readSuspicion(ns, lineage) {
+  const key = `sus:${lineage}`;
+  try { return await stub(ns, key).total(key); } catch { return null; }
 }

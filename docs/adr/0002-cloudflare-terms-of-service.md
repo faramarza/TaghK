@@ -1,8 +1,11 @@
 # ADR-0002 — Cloudflare Terms of Service and Tier A
 
-**Status:** ESCALATED — requires a human decision. Do not proceed past P1
-planning on Tier A until this is answered.
-**Closes:** 04-STATUS.md 2.4 (research complete; decision outstanding)
+**Status:** DECIDED by the project lead. Options A (separate accounts) and D
+(narrow Tier A to the control channel) now; option C (relocate the CDN-fronted
+transport to a provider whose terms permit it) as the destination. Option B —
+seeking Cloudflare's approval — was **not** taken.
+**Closes:** 04-STATUS.md 2.4. The contractual question is answered; the
+provider shortlist it creates is not.
 **Author's standing:** engineer, not a lawyer. Everything below is research to
 inform counsel and the project lead, not legal advice.
 
@@ -99,7 +102,46 @@ enforcement outcome is account termination, at scale, without notice, with the
 distribution plane inside the blast radius. Users under a hostile government
 lose access at the moment the system is most used. Reject.
 
-## Recommendation
+## Decision
+
+**A + D now, C as the destination. B was not taken.**
+
+The project lead chose to separate the accounts and narrow Tier A immediately,
+and to move the CDN-fronted transport off Cloudflare rather than seek
+permission to keep it there.
+
+That is a stronger position than the one this ADR originally recommended, and
+worth stating explicitly: **Tier A does not stay on Cloudflare.** Approval, had
+it been sought and granted, would have left the project dependent on a
+discretionary permission that can be withdrawn — by a company whose terms
+already changed once in a direction that broke this design, and which is
+subject to pressure the project cannot see or answer. Not asking means not
+being told no, and not building on an answer that can be revoked.
+
+The consequence is that C is now on the critical path rather than a
+contingency, and it needs a provider shortlist before P4 rather than after.
+
+### What this means concretely
+
+1. **Now:** distribution and measurement on a Cloudflare account that never
+   carries tunnelled traffic. Nothing about those two Workers is prohibited.
+2. **Now:** Tier A's role narrows to the control channel — credential issuance,
+   subscription polling, measurement collection. All permitted, and it is the
+   half that determines whether a user can recover at all under default-deny.
+3. **Next:** identify a provider for CDN-fronted transport whose terms permit
+   it. Until then Tier D plus the P4 second-shape fleet carry bulk traffic, so
+   **P4 moves up the order** — it is no longer diversity, it is the bulk path.
+4. **Never:** tunnelled traffic on the Cloudflare account that serves the
+   subscription URL.
+
+### Still open
+
+The provider question in (3) is not answered by this decision, only pointed at.
+It needs a real shortlist evaluated on terms, jurisdiction, ASN diversity, and
+whether the operator can hold an account there without exposing an identity.
+That is P4 work and it should not be deferred to P4's start.
+
+## Original recommendation (retained for the record)
 
 **A + D now, B in parallel, C as the contingency.**
 

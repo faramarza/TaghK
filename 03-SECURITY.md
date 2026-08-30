@@ -192,7 +192,7 @@ Each plane holds different secrets. Compromise of one must not yield another.
 |---|---|---|---|
 | `ADMIN_KEY` | Distributor | Quarterly | Rotate immediately — **safe**, because `KEY_SALT` is separate and hashes survive |
 | `KEY_SALT` | Distributor | **Never** | Rotating invalidates all stored digests. Treat as permanent. |
-| `VOPRF_SK` | Distributor | On compromise only | All outstanding tokens become invalid; users must re-enrol |
+| `VOPRF_MASTER` | Distributor | On compromise only | Every epoch key derives from it, past and future, so compromise invalidates all outstanding tokens and users must re-enrol. Per-epoch keys are derived, never stored, and never rotated by hand. |
 | `PROBE_HMAC_KEY` | Collector | Quarterly | All probe tokens invalid; probes must re-enrol |
 | `MANIFEST_SK` | Collector | On compromise only | **Critical** — an attacker can direct volunteers' devices. Rotate and push a client update immediately. |
 | `COLLECTOR_ADMIN` | Collector | Quarterly | Rotate |
@@ -229,7 +229,7 @@ Do not serve real users until every line is true.
 
 ```
 [ ] KEY_SALT generated and DISTINCT from ADMIN_KEY
-[ ] VOPRF_SK generated via voprf.js generateKey()
+[ ] VOPRF_MASTER generated via voprf.js generateMaster()
 [ ] MANIFEST_SK generated; public key PINNED into every probe agent build
 [ ] Distributor and collector on SEPARATE Workers, KV namespaces, admin keys
 [ ] Client verifies DLEQ proofs — confirm unblind() throws on a tampered proof

@@ -22,7 +22,9 @@ id = "REPLACE_NODES_ID"
 #   ADMIN_KEY   openssl rand -hex 32   rotate quarterly
 #   KEY_SALT    openssl rand -hex 32   NEVER ROTATE (invalidates all digests)
 #                                      MUST DIFFER from ADMIN_KEY
-#   VOPRF_SK    npm run keygen:voprf
+#   VOPRF_MASTER  npm run keygen:voprf
+#               Per-epoch keys are DERIVED from this; there is no rotation
+#               ceremony and nothing else to set. See voprf.js 'Key epochs'.
 
 # ── Strongly consistent storage (04-STATUS.md defects 2.1 / 2.2) ───────────
 # Spend records and rate limiters CANNOT live in KV: a read-then-write against
@@ -37,9 +39,19 @@ class_name = "Ledger"
 name = "RATE_LIMITER"
 class_name = "RateLimiter"
 
+# Reverse index and suspicion counters (04-STATUS.md 2.8). The lineage blob
+# itself stays in KV — it is read on every subscription poll.
+[[durable_objects.bindings]]
+name = "ATTRIBUTION"
+class_name = "Attribution"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["Ledger", "RateLimiter"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["Attribution"]
 
 [observability]
 enabled = false               # no logs, architecturally — not as policy

@@ -117,6 +117,77 @@ export const hashToGroup = (tokenBytes) =>
 // Server key material
 // ───────────────────────────────────────────────────────────────────────────
 
+// ───────────────────────────────────────────────────────────────────────────
+// Key epochs
+// ───────────────────────────────────────────────────────────────────────────
+//
+// WHY EPOCHS EXIST
+//
+// A spend record cannot be kept forever — storage grows with every token ever
+// issued and never shrinks. But if a spend record expires while its token is
+// still valid, the token can be presented again: replay bounded only by
+// patience (04-STATUS.md 2.6).
+//
+// Epochs bound token validity instead of trusting the spend log to outlive it.
+// Every issuance happens under a key derived for the current epoch; the server
+// accepts the current epoch and the one before it, and nothing older. A spend
+// record therefore only has to outlive two epochs, after which the token it
+// covers is refused on its own terms and the record can be dropped safely.
+//
+// THE COST, STATED PLAINLY
+//
+// The epoch travels with the token and is visible at redemption, so the
+// anonymity set is partitioned by issuance period rather than being global.
+// With a 30-day epoch the server learns "issued this month or last month" and
+// nothing more. That is the standard Privacy Pass trade and it is a real cost:
+// a smaller epoch means a smaller crowd to hide in. Do not shorten it for
+// operational convenience.
+//
+// DERIVATION RATHER THAN ROTATION
+//
+// Epoch keys are derived from one master secret rather than generated and
+// rotated by hand. A rotation ceremony that must happen on a schedule is a
+// ceremony that stops happening, and a missed rotation here is silent.
+//
+// The cost of that choice: compromise of the master yields every epoch, past
+// and future, where independently generated keys plus secure deletion of
+// retired ones would have protected the past. Deletion is the part operators
+// do not actually do, so this trades a theoretical property for one that holds
+// in practice — but it IS a trade, and it is recorded here rather than assumed.
+
+/** Seconds per epoch. Also the granularity of the anonymity-set partition. */
+export const EPOCH_LENGTH_S = 30 * 86400;
+
+/** The epoch an issuance at this time belongs to. */
+export const currentEpoch = (nowMs = Date.now()) =>
+  Math.floor(nowMs / 1000 / EPOCH_LENGTH_S);
+
+/** 32 random bytes. The only VOPRF secret an operator ever handles. */
+export function generateMaster() {
+  const m = new Uint8Array(32);
+  crypto.getRandomValues(m);
+  return toHex(m);
+}
+
+/**
+ * Derive the secret key for one epoch. Domain-separated so an epoch key can
+ * never collide with any other use of the master.
+ */
+export function deriveEpochKey(masterHex, epoch) {
+  if (!Number.isSafeInteger(epoch) || epoch < 0) throw new Error('bad epoch');
+  const wide = sha512(concat(
+    CTX, new Uint8Array([0x05]), fromHex(masterHex),
+    new TextEncoder().encode(`epoch:${epoch}`)
+  ));
+  const k = scalarFromWide(wide);
+  return toHex(scalarToBytes(k === 0n ? 1n : k));
+}
+
+/** Public key for an epoch — what the client verifies the DLEQ proof against. */
+export function epochPublicKey(masterHex, epoch) {
+  return RistrettoPoint.BASE.multiply(loadSecret(deriveEpochKey(masterHex, epoch))).toHex();
+}
+
 export function generateKey() {
   const k = randomScalar();
   return {

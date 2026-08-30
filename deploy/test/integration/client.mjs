@@ -60,11 +60,15 @@ if (cmd === 'enrol') {
   const tokens = unblind(items, out.evaluated, out.proof, out.public_key);
 
   const cred = await post('/api/credentials', {
-    token: { t: tokens[0].token, w: tokens[0].witness }, device_pubkey: spki,
+    // The epoch travels with the token; the server uses it to pick the key.
+    token: { t: tokens[0].token, w: tokens[0].witness, e: out.epoch }, device_pubkey: spki,
   });
   if (cred.status !== 200) { console.error(`credentials failed: ${cred.status}`); process.exit(1); }
   const c = await cred.json();
-  console.log(JSON.stringify({ ...c, device_sk: pkcs8, device_pk: spki }));
+  // The client joins the returned PATH to the base it already contacted; it
+  // never trusts the server to tell it its own address (04-STATUS.md 2.15).
+  const subscription = new URL(c.subscription_path, base).toString();
+  console.log(JSON.stringify({ ...c, subscription, device_sk: pkcs8, device_pk: spki }));
 } else if (cmd === 'poll') {
   const [lineage, sk] = rest;
   const key = await webcrypto.subtle.importKey('pkcs8', Buffer.from(sk, 'base64'),

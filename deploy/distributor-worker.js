@@ -78,17 +78,22 @@
  *   KV      NODES         inventory, reverse index, fallbacks
  *   DO      LEDGER        spent tokens, single-use PoW  — STRONGLY CONSISTENT
  *   DO      RATE_LIMITER  request counters              — STRONGLY CONSISTENT
+ *   DO      ATTRIBUTION   reverse index, suspicion      — STRONGLY CONSISTENT
  *   Secret  ADMIN_KEY  operator API auth
  *   Secret  KEY_SALT   hashing pepper — SEPARATE from ADMIN_KEY so that
  *                      rotating the admin key does not invalidate every hash
- *   Secret  VOPRF_SK   VOPRF secret key (see voprf.js generateKey())
+ *   Secret  VOPRF_MASTER  VOPRF master secret. Per-epoch keys are DERIVED from
+ *                        it (voprf.js); it is never used to sign anything
+ *                        directly. Generate with `npm run keygen:voprf`.
  */
 
-import { issue, verifyToken as voprfVerify, spendKey, timingSafeEqual } from './voprf.js';
-import { claimOnce, overLimit } from './durable.js';
+import { issue, verifyToken as voprfVerify, spendKey, timingSafeEqual,
+         currentEpoch, deriveEpochKey, EPOCH_LENGTH_S } from './voprf.js';
+import { claimOnce, overLimit, implicateLineage, drainImplicated,
+         bumpSuspicion, readSuspicion } from './durable.js';
 
 // Durable Object classes must be exported from the Worker entry point.
-export { Ledger, RateLimiter } from './durable.js';
+export { Ledger, RateLimiter, Attribution } from './durable.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tunables
@@ -116,10 +121,18 @@ const CFG = {
   RATE_MAX_CHALLENGE: 30,
   RATE_MAX_ISSUE: 10,
 
-  // How long a spend record is retained. A token presented after this window
-  // would be accepted again — see 04-STATUS.md defect 2.6. Do not shorten it
-  // without reading that entry first.
-  SPEND_TTL_S: 30 * 86400,
+  // A spend record only has to outlive the validity of the token it covers.
+  // Tokens are valid in their issuing epoch and the one after, so two epochs
+  // plus a margin for clock skew is sufficient and the record can then be
+  // dropped safely. Before epochs existed this was a bare 30 days and a token
+  // held longer than that could simply be replayed (04-STATUS.md 2.6).
+  SPEND_TTL_S: 2 * EPOCH_LENGTH_S + 7 * 86400,
+
+  LINEAGE_TTL_S: 180 * 86400,
+  // A node held by more lineages than this stops recording new ones. Attribution
+  // is saturated long before here, and an unbounded set is a storage bug an
+  // adversary can drive by enrolling repeatedly.
+  MAX_IMPLICATED_PER_NODE: 10000,
 
   MAX_BODY_BYTES: 64 * 1024,
 };
@@ -363,9 +376,13 @@ async function issueTokens(request, env) {
 
   // The server sees only uniformly random group elements here. It cannot link
   // any of these to a later redemption — that is the whole point of the blind.
+  // Issued under the CURRENT epoch's key. The epoch travels with the tokens so
+  // the client can present it at redemption and the server knows which key to
+  // check against.
+  const epoch = currentEpoch();
   let result;
   try {
-    result = issue(env.VOPRF_SK, blinded, CFG.MAX_BLIND_BATCH);
+    result = issue(deriveEpochKey(env.VOPRF_MASTER, epoch), blinded, CFG.MAX_BLIND_BATCH);
   } catch {
     return json({ error: 'invalid' }, 400);
   }
@@ -374,13 +391,25 @@ async function issueTokens(request, env) {
     evaluated: result.evaluated,
     proof: result.proof,           // DLEQ — client MUST verify; see voprf.js
     public_key: result.public_key,
+    epoch,
+    epoch_length_s: EPOCH_LENGTH_S,
   });
 }
 
 async function redeem(env, token) {
   if (!token?.t || !token?.w) return false;
   if (!/^[0-9a-f]{64}$/.test(token.t) || !/^[0-9a-f]{64}$/.test(token.w)) return false;
-  if (!voprfVerify(env.VOPRF_SK, token.t, token.w)) return false;
+
+  // The token names its epoch. Only the current one and its predecessor are
+  // accepted — anything older is refused on its own terms rather than relying
+  // on a spend record still being around to catch it.
+  const now = currentEpoch();
+  const epoch = token.e;
+  if (!Number.isSafeInteger(epoch) || epoch > now || epoch < now - 1) return false;
+
+  let key;
+  try { key = deriveEpochKey(env.VOPRF_MASTER, epoch); } catch { return false; }
+  if (!voprfVerify(key, token.t, token.w)) return false;
 
   // Double-spend check. The stored key is a peppered hash, so the spend log
   // reveals nothing about tokens that have not yet been presented.
@@ -389,7 +418,9 @@ async function redeem(env, token) {
   // The KV version returned true in every colo that read the record before it
   // propagated, which let an adversary multiply their credential draw by their
   // number of vantage points — unbounded for a state actor. See 04-STATUS 2.1.
-  return claimOnce(env.LEDGER, `spent:${spendKey(token.t, env.KEY_SALT)}`, CFG.SPEND_TTL_S);
+  // Namespaced by epoch so a retired epoch's records can be dropped wholesale
+  // without any chance of colliding with a live one.
+  return claimOnce(env.LEDGER, `spent:${epoch}:${spendKey(token.t, env.KEY_SALT)}`, CFG.SPEND_TTL_S);
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -451,28 +482,50 @@ async function getCredentials(request, env) {
   const nextProof = randHex(24);
   state.proof_hash = await peppered(env, 'lin', nextProof);
 
+  // Refresh the cached suspicion from the authoritative counter. This is the
+  // only place that reads it: the subscription poll — hourly, from every client,
+  // on connections that are already bad — uses the cached value and never waits
+  // on a Durable Object. A null means the object was unreachable; keep the last
+  // known value rather than silently resetting a lineage's history to zero.
+  const authoritative = await readSuspicion(env.ATTRIBUTION, lineageId);
+  if (authoritative !== null) state.suspicion = authoritative;
+
   state.assignments = await assignNodes(env, state);
   state.updated = Date.now();
 
   await env.ACCOUNTS.put(`lin:${lineageId}`, JSON.stringify(state), {
-    expirationTtl: 180 * 86400,
+    expirationTtl: CFG.LINEAGE_TTL_S,
   });
 
   // Reverse index: node -> lineages. Without this, attribution requires scanning
   // every lineage in KV, which is both slow and a denial-of-service vector.
+  //
+  // In a Durable Object, not KV. The KV version was a read-then-write, so two
+  // clients assigned the same node concurrently could each read the set without
+  // the other's entry and one append would be lost — and the lineage that
+  // vanished from the index escapes attribution completely. The censor is by
+  // construction the lineage holding the most burned nodes, which makes them
+  // the one most likely to be dropped (04-STATUS.md 2.8).
   for (const nid of state.assignments) {
-    const k = `idx:${nid}`;
-    const set = JSON.parse((await env.NODES.get(k)) || '[]');
-    if (!set.includes(lineageId)) {
-      set.push(lineageId);
-      await env.NODES.put(k, JSON.stringify(set), { expirationTtl: 180 * 86400 });
-    }
+    await implicateLineage(env.ATTRIBUTION, nid, lineageId,
+      CFG.LINEAGE_TTL_S, CFG.MAX_IMPLICATED_PER_NODE);
   }
 
   return json({
     lineage: lineageId,
     lineage_proof: nextProof,          // client stores this; required next time
-    subscription: `${new URL(request.url).origin}/sub/${lineageId}`,
+    // A PATH, not a URL.
+    //
+    // This used to return `${new URL(request.url).origin}/sub/...`. Behind
+    // anything that terminates TLS and forwards over HTTP — which is what a
+    // CDN-fronted deployment is — the origin the Worker sees is not the origin
+    // the client used: the integration harness got back `http://127.0.0.1/sub/…`,
+    // with the scheme and port wrong. The value was also derived from a Host
+    // header the caller controls.
+    //
+    // The client already knows which base URL it just contacted. It joins this
+    // path to that. See 04-STATUS.md 2.15.
+    subscription_path: `/sub/${lineageId}`,
     poll_interval_s: CFG.SUBSCRIPTION_TTL_S,
   });
 }
@@ -530,7 +583,7 @@ async function subscription(request, env, path) {
   const live = state.assignments.filter((nid) => byId[nid]?.status === 'active');
   if (live.length < CFG.NODES_PER_LINEAGE) {
     state.assignments = await assignNodes(env, { ...state, assignments: live });
-    await env.ACCOUNTS.put(`lin:${id}`, JSON.stringify(state), { expirationTtl: 180 * 86400 });
+    await env.ACCOUNTS.put(`lin:${id}`, JSON.stringify(state), { expirationTtl: CFG.LINEAGE_TTL_S });
   }
 
   const uris = [];
@@ -650,16 +703,27 @@ async function adminReportBlocked(request, env, ctx) {
 
   // A burned PROTECTED node is far more incriminating — few lineages reach it.
   const weight = { sacrificial: 0.5, standard: 1.0, protected: 2.5 }[node.pool] ?? 1.0;
-  const implicated = JSON.parse((await env.NODES.get(`idx:${nodeId}`)) || '[]');
+
+  // Read and clear in one indivisible step, so two burns of the same node
+  // cannot count the same lineage twice.
+  const implicated = await drainImplicated(env.ATTRIBUTION, nodeId);
 
   const work = (async () => {
     for (const lid of implicated) {
+      // Authoritative, atomic. Concurrent burns of different nodes used to read
+      // the same lineage blob and each write back their own increment, so all
+      // but one were lost.
+      const total = await bumpSuspicion(env.ATTRIBUTION, lid, weight, CFG.LINEAGE_TTL_S);
+      if (total === null) continue;
+
+      // Mirror into the lineage blob so the subscription path sees the demotion
+      // at the next poll without having to read the Durable Object. Best effort:
+      // the counter above is the truth, and the credential path re-syncs it.
       const st = JSON.parse((await env.ACCOUNTS.get(`lin:${lid}`)) || 'null');
       if (!st) continue;
-      st.suspicion = (st.suspicion || 0) + weight;
-      await env.ACCOUNTS.put(`lin:${lid}`, JSON.stringify(st), { expirationTtl: 180 * 86400 });
+      st.suspicion = total;
+      await env.ACCOUNTS.put(`lin:${lid}`, JSON.stringify(st), { expirationTtl: CFG.LINEAGE_TTL_S });
     }
-    await env.NODES.delete(`idx:${nodeId}`);
   })();
 
   ctx?.waitUntil ? ctx.waitUntil(work) : await work;

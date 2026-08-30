@@ -9,7 +9,7 @@
 import { unstable_dev } from 'wrangler';
 import { generateKeyPairSync } from 'node:crypto';
 import { rmSync } from 'node:fs';
-import { generateKey } from '../../voprf.js';
+import { generateMaster, currentEpoch, epochPublicKey } from '../../voprf.js';
 
 const PERSIST = process.env.PERSIST_DIR || '/tmp/tk-integration';
 const DIST_PORT = Number(process.env.DIST_PORT || 8787);
@@ -17,7 +17,7 @@ const COLL_PORT = Number(process.env.COLL_PORT || 8788);
 
 rmSync(PERSIST, { recursive: true, force: true });
 
-const voprf = generateKey();
+const voprfMaster = generateMaster();
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
 
 const env = {
@@ -26,7 +26,7 @@ const env = {
   KEY_SALT: 'sa'.repeat(32),
   PROBE_HMAC_KEY: 'ph'.repeat(32),
   ENROL_SALT: 'en'.repeat(32),
-  VOPRF_SK: voprf.secret,
+  VOPRF_MASTER: voprfMaster,
   MANIFEST_SK: privateKey.export({ type: 'pkcs8', format: 'der' }).toString('base64'),
 };
 
@@ -34,7 +34,7 @@ const common = { local: true, experimental: { disableExperimentalWarning: true }
 
 const dist = await unstable_dev('distributor-worker.js', {
   ...common, config: 'wrangler.toml', port: DIST_PORT, persistTo: `${PERSIST}/dist`,
-  vars: { ADMIN_KEY: env.ADMIN_KEY, KEY_SALT: env.KEY_SALT, VOPRF_SK: env.VOPRF_SK },
+  vars: { ADMIN_KEY: env.ADMIN_KEY, KEY_SALT: env.KEY_SALT, VOPRF_MASTER: env.VOPRF_MASTER },
 });
 
 const coll = await unstable_dev('collector-worker.js', {
@@ -52,7 +52,7 @@ console.log(JSON.stringify({
   admin_key: env.ADMIN_KEY,
   collector_admin: env.COLLECTOR_ADMIN,
   operator_pubkey: publicKey.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64'),
-  voprf_public: voprf.public,
+  voprf_public: epochPublicKey(voprfMaster, currentEpoch()),
 }));
 
 const shutdown = async () => {

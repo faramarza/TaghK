@@ -209,6 +209,49 @@ repeatedly contacting a burned endpoint.
 its output. If that call fails it prints an explicit instruction to do it by
 hand rather than continuing quietly.
 
+#### 2.6 A token could be replayed once its spend record expired — *closed*
+
+Spend records carried a flat 30-day TTL. A token held longer and then presented
+was accepted again, because the record proving it had been spent was gone. Not
+the parallel-redemption attack — that is closed — but a replay path bounded only
+by patience.
+
+**Closed by** ADR-0004: key epochs. Issuance happens under a key derived for the
+current epoch; the server accepts the current epoch and its predecessor and
+refuses anything older, so a token is refused on its own terms rather than
+relying on a spend record still existing to catch it. Records are namespaced by
+epoch and only have to outlive two of them.
+
+**The cost, recorded rather than buried:** the epoch is visible at redemption,
+so the anonymity set is partitioned by issuance period instead of being global.
+With a 30-day epoch the server learns "issued this month or last month". Do not
+shorten `EPOCH_LENGTH_S` — a smaller epoch is a smaller crowd to hide in.
+
+#### 2.8a Lost updates on the reverse index and suspicion — *closed*
+
+`idx:<node>` and `lin:<id>.suspicion` were read-then-writes on KV. A lost append
+to the reverse index meant a lineage **escaped attribution entirely, in
+silence** — and since the censor is by construction the lineage holding the most
+burned nodes, the mechanism failed hardest against the adversary it exists for.
+
+**Closed by** ADR-0005: an `Attribution` Durable Object holds both. The lineage
+blob stays in KV because it is read on every subscription poll; only the values
+written concurrently moved. These helpers deliberately fail OPEN — denying
+credentials because a bookkeeping object blinked would cost a real person their
+connection to protect a reputation score (I3).
+
+#### 2.15 The subscription URL was built from the request's own origin — *closed*
+
+`getCredentials()` returned `${new URL(request.url).origin}/sub/…`. Behind
+anything that terminates TLS and forwards over HTTP — which is what a
+CDN-fronted deployment is — that origin is not the one the client used: the
+integration harness was handed `http://127.0.0.1/sub/…`, scheme and port wrong.
+The value also derived from a caller-controlled `Host` header.
+
+**Closed:** the endpoint returns `subscription_path` and the client joins it to
+the base URL it already contacted. It never trusts the server to tell it its own
+address.
+
 #### 2.16 The node forwarded a client address into Xray — *new, closed*
 
 `bootstrap.sh` set `proxy_set_header X-Real-IP $remote_addr` on the WebSocket
@@ -220,9 +263,9 @@ than a live leak, and it is described at that severity. It was also one config
 change away from being a record, for no benefit. **Closed:** removed, with a
 test asserting no client-address header is forwarded.
 
-### ESCALATED — needs a human decision
+### DECIDED
 
-#### 2.4 Cloudflare Terms of Service — *researched; decision outstanding*
+#### 2.4 Cloudflare Terms of Service — *researched, decided*
 
 **Researched and answered as a question; not decided.** Cloudflare's terms were
 updated on 3 December 2024 to state explicitly that proxy services, such as a
@@ -238,39 +281,83 @@ down both at once, without notice, at peak usage.
 Sanctions are not the obstacle — OFAC General License D-2 (31 CFR § 560.540)
 authorises anti-censorship tools for Iran. The blocker is contractual.
 
-**Recommendation and options: `docs/adr/0002-cloudflare-terms-of-service.md`.**
-Requires the project lead, and counsel. Do not proceed with Tier A until
-answered.
+**Decided by the project lead: Tier A does not stay on Cloudflare.**
+Separate the accounts and narrow Tier A to the control channel now; relocate
+CDN-fronted transport to a provider whose terms permit it. Cloudflare's approval
+was deliberately not sought — a discretionary permission can be withdrawn, by a
+company whose terms already changed once in a direction that broke this design.
+
+**Consequence: P4 (second-shape transport) moves up the order.** It is no longer
+the diversity layer, it is the bulk path until a permitting CDN provider is
+found. That provider shortlist is now open work — see
+`docs/adr/0002-cloudflare-terms-of-service.md`.
 
 ### OPEN
 
-#### 2.6 A token can be replayed once its spend record expires — *moderate*
+#### 2.17 DLEQ verification does not prevent tagging unless the issuer public key is pinned — **critical**
 
-Spend records carry a 30-day TTL (`CFG.SPEND_TTL_S`), inherited from the KV
-implementation. A token held for longer than that and then presented is
-accepted again, because the record proving it was spent has gone.
+**A security property the documents assert does not hold as implemented.**
+Found while implementing key epochs, by asking what the client actually
+verifies the proof *against*.
 
-Not exploitable for the parallel-redemption attack — that is closed — but it is
-a slow replay path with no bound other than patience. Options: bind tokens to a
-key epoch so old tokens become invalid rather than merely unrecorded; retain
-spend records permanently and accept the storage growth; or expire tokens
-themselves at issuance. This wants a decision, not a default. **Do not shorten
-the TTL as a cost saving — that makes the window come sooner.**
+`/api/issue` returns `{evaluated, proof, public_key}`. The client calls
+`unblind(items, evaluated, proof, public_key)`, which verifies the batched
+Chaum–Pedersen proof **against the public key that came in the same response.**
 
-#### 2.8 Lost updates remain on lineage state, the reverse index, and inventory
+That check proves the server used *some* key consistently. It does not prove the
+server used *everyone's* key. A malicious or compromised server picks a distinct
+`k_user` per client, evaluates under it, and produces a perfectly valid DLEQ
+proof with respect to `Y_user = G·k_user`. `verifyBatch()` returns true. At
+redemption the server tries each stored `k_user` until one verifies, and has
+identified the user exactly.
 
-Three read-then-writes on KV were deliberately left alone in the P0 pass because
-moving them is an architecture decision, not a bug fix:
+**This is the precise attack the DLEQ proof exists to stop**, described at the
+top of `voprf.js` and asserted in 03-SECURITY.md §2.3 — "forces the server to
+demonstrate it used the one advertised public key, so every token in existence
+shares one anonymity set". The word doing the work is *advertised*, and nothing
+in the system currently makes the advertised key anything other than whatever
+the server said this time.
 
-- `lin:<id>` — concurrent updates can lose a suspicion increment
-- `idx:<node>` — a lost update lets a lineage escape attribution entirely
-- `inventory` — concurrent operator writes can clobber each other
+So invariant I2 is, today, **verified but not anchored**: `unblind()` correctly
+throws on a tampered proof, and that is worth having, but it is not yet the
+anti-tagging guarantee the architecture claims.
 
-None permits a double-spend. All three weaken **attribution**, which is the
-burn-response loop that the rest of the system's safety rests on. Moving
-lineage state to Durable Objects would take the subscription hot path off
-edge-cached storage; that needs its own ADR and the human's sign-off. See
-ADR-0001 "What this does NOT fix".
+**Why it has not bitten:** there is no client. The only consumer is
+`test/distributor.test.mjs`, which does pin — it checks
+`public_key === epochPublicKey(master, epoch)` because it generated the master.
+A real client cannot do that.
+
+**What a fix requires** (this is a design decision, not a patch, and it is
+escalated rather than chosen here):
+
+1. The client must know the canonical issuer key independently of the issuance
+   response. Standard answers are pinning it in the reproducible, signed client
+   build (P7), or fetching a signed key-commitment document.
+2. Epochs make a single pinned key insufficient, since the key legitimately
+   changes. The usual construction is a long-term commitment key pinned in the
+   build, which signs the list of epoch public keys.
+3. Signing alone is not sufficient either: an operator can sign a per-user key.
+   Only transparency closes it — the commitment document must be identical for
+   everyone, publicly fetchable, and cross-checkable, so a per-user key is
+   *detectable* even though it is not preventable.
+
+**Consequence for sequencing:** this must be settled before P2 writes the
+client's issuance path, and it makes P7 (reproducible, signed builds) a
+dependency of the anonymity claim rather than a trust nicety.
+
+Until it is settled, the honest statement of what the system provides against a
+malicious server is: **unlinkability by the blind, and tamper-evidence on the
+proof — but not anti-tagging.**
+
+#### 2.8 Node inventory can still lose concurrent operator writes — *low*
+
+The reverse index and the suspicion counters moved to Durable Objects
+(ADR-0005); `inventory` did not. Two operators writing the node list at the same
+moment can still clobber each other.
+
+Out of the decided scope, operator-side rather than user-facing, and the failure
+mode is two admins racing rather than an adversary. Left open deliberately
+rather than quietly closed.
 
 #### 2.11 Builtin canary reachability from inside Iran is unverified — *blocks P5*
 
@@ -283,23 +370,6 @@ honest volunteers. But the pool still needs empirical validation from the first
 honest probes before their reports are allowed to influence anything, and the
 operator pool needs populating before decoys stop being separable from real
 nodes by address shape. Both are P5 prerequisites and are listed in ADR-0003.
-
-#### 2.15 The subscription URL is built from the request's own origin — *low, open*
-
-`getCredentials()` returns `subscription: ${new URL(request.url).origin}/sub/…`.
-Behind anything that terminates TLS and forwards over HTTP — which is what Tier
-A is — the origin the Worker sees is not the origin the client used. In the
-integration harness the client is handed `http://127.0.0.1/sub/…`: wrong scheme,
-missing port.
-
-On Cloudflare `request.url` does reflect the public URL, so this is probably
-inert in the intended deployment. It is recorded because it is invisible until
-a fronting layer changes, the value is derived from an attacker-settable `Host`
-header, and the client that will consume it does not exist yet (P2).
-
-**Recommended fix:** serve a configured public origin, or have the client
-construct `<base>/sub/<lineage>` itself and ignore the field. Decide before the
-client is written, not after.
 
 
 ---
@@ -361,7 +431,7 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Largely addressed. `deploy/test/` runs **206 checks across seven suites**:
+Largely addressed. `deploy/test/` runs **220 checks across seven suites**:
 
 | Suite | What it runs |
 |---|---|

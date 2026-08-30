@@ -22,7 +22,8 @@ import { unstable_dev } from 'wrangler';
 import { createHash, webcrypto } from 'node:crypto';
 import { rmSync, readFileSync } from 'node:fs';
 import { section, check, eq, throws, summary } from './harness.mjs';
-import { blind, unblind, verifyBatch, generateKey } from '../voprf.js';
+import { blind, unblind, verifyBatch, issue as voprfIssue,
+         generateMaster, currentEpoch, deriveEpochKey, epochPublicKey } from '../voprf.js';
 
 const ADMIN_KEY = 'a1'.repeat(32);
 const PERSIST = `/tmp/tk-dist-${process.pid}`;
@@ -58,14 +59,15 @@ async function makeDevice() {
 }
 
 // Generated per run, so no key material ever lands in the tree (03-SECURITY §4).
-const voprfKey = generateKey();
+const voprfMaster = generateMaster();
+const EPOCH = currentEpoch();
 
 rmSync(PERSIST, { recursive: true, force: true });
 const w = await unstable_dev('distributor-worker.js', {
   config: 'wrangler.toml',
   local: true,
   persistTo: PERSIST,
-  vars: { ADMIN_KEY, KEY_SALT: 'b2'.repeat(32), VOPRF_SK: voprfKey.secret },
+  vars: { ADMIN_KEY, KEY_SALT: 'b2'.repeat(32), VOPRF_MASTER: voprfMaster },
   experimental: { disableExperimentalWarning: true },
 });
 
@@ -76,9 +78,16 @@ const post = (path, body, headers = {}) =>
     body: typeof body === 'string' ? body : JSON.stringify(body),
   });
 
-/** Run the whole issuance flow and return unblinded tokens. */
-async function getTokens(device, count = 4) {
-  const ch = await (await w.fetch('http://d/api/challenge', { headers: IP })).json();
+/**
+ * Run the whole issuance flow and return unblinded tokens.
+ *
+ * `hint` selects the rate-limit bucket. Issuance is capped at 10/minute per
+ * client hint, so a section that needs many credentials uses its own — testing
+ * one control must not be starved by another.
+ */
+async function getTokens(device, count = 4, hint = '10.0.0.1') {
+  const H = { 'cf-connecting-ip': hint };
+  const ch = await (await w.fetch('http://d/api/challenge', { headers: H })).json();
   const nonce = solvePow(ch.challenge, ch.bits);
   const items = blind(count);
   const res = await post('/api/issue', {
@@ -86,7 +95,7 @@ async function getTokens(device, count = 4) {
     blinded: items.map((i) => i.blinded),
     device_pubkey: device.spki,
     device_sig: await device.sign(ch.challenge),
-  });
+  }, H);
   if (res.status !== 200) throw new Error(`issue failed: ${res.status}`);
   const out = await res.json();
   return { tokens: unblind(items, out.evaluated, out.proof, out.public_key), raw: out, items };
@@ -108,7 +117,9 @@ try {
   const t0 = Date.now();
   const first = await getTokens(device, 8);
   check(first.tokens.length === 8, `issued 8 tokens with a verified DLEQ proof`, `${Date.now() - t0}ms incl. PoW`);
-  check(first.raw.public_key === voprfKey.public, 'server advertises the expected public key');
+  check(first.raw.public_key === epochPublicKey(voprfMaster, EPOCH),
+    'server advertises the public key derived for the current epoch');
+  eq(first.raw.epoch, EPOCH, 'issuance names its epoch');
   check(verifyBatch(first.raw.public_key, first.items.map((i) => i.blinded), first.raw.evaluated, first.raw.proof),
     'DLEQ proof from the live server verifies independently');
 
@@ -120,10 +131,15 @@ try {
   ], { 'x-admin-key': ADMIN_KEY });
   eq(seed.status, 200, 'operator seeds node inventory');
 
-  const cred = await post('/api/credentials', { token: { t: first.tokens[0].token, w: first.tokens[0].witness }, device_pubkey: device.spki });
+  const cred = await post('/api/credentials', { token: { t: first.tokens[0].token, w: first.tokens[0].witness, e: EPOCH }, device_pubkey: device.spki });
   eq(cred.status, 200, 'POST /api/credentials redeems a token');
   const credJson = await cred.json();
   check(/^[0-9a-f]{32}$/.test(credJson.lineage), 'a lineage id is returned');
+  eq(credJson.subscription_path, `/sub/${credJson.lineage}`,
+    'a subscription PATH is returned, not a server-guessed absolute URL');
+  check(!('subscription' in credJson),
+    'no absolute URL derived from the request origin is served (2.15)',
+    'behind a TLS terminator that origin is wrong and Host is caller-controlled');
 
   const ts = Date.now();
   const sub = await w.fetch(`http://d/sub/${credJson.lineage}`, {
@@ -141,14 +157,14 @@ try {
   const victim = tokens[0];
   const PARALLEL = 32;
   const responses = await Promise.all(Array.from({ length: PARALLEL }, () =>
-    post('/api/credentials', { token: { t: victim.token, w: victim.witness }, device_pubkey: device.spki })
+    post('/api/credentials', { token: { t: victim.token, w: victim.witness, e: EPOCH }, device_pubkey: device.spki })
   ));
   const codes = responses.map((r) => r.status);
   const ok = codes.filter((c) => c === 200).length;
   eq(ok, 1, `one token fired from ${PARALLEL} parallel requests is accepted exactly once`);
   eq(codes.filter((c) => c === 403).length, PARALLEL - 1, 'every other parallel request is rejected');
 
-  const again = await post('/api/credentials', { token: { t: victim.token, w: victim.witness }, device_pubkey: device.spki });
+  const again = await post('/api/credentials', { token: { t: victim.token, w: victim.witness, e: EPOCH }, device_pubkey: device.spki });
   eq(again.status, 403, 'sequential replay of a spent token is rejected');
 
   // ── I-defect-2: the rate limiter actually limits ────────────────────────
@@ -170,6 +186,41 @@ try {
     'over-limit requests get the standard decoy, not a distinct error');
 
   // ── adversarial ────────────────────────────────────────────────────────
+  section('key epochs — validity is bounded by the epoch, not by the spend log');
+
+  // Mint tokens locally under a chosen epoch's key. The server only ever issues
+  // under the current one, so this is the only way to test acceptance of the
+  // previous epoch and refusal of older ones without waiting a month.
+  const mintForEpoch = (epoch) => {
+    const items = blind(2);
+    const res = voprfIssue(deriveEpochKey(voprfMaster, epoch), items.map((i) => i.blinded));
+    return unblind(items, res.evaluated, res.proof, res.public_key);
+  };
+
+  {
+    const prev = mintForEpoch(EPOCH - 1)[0];
+    eq((await post('/api/credentials', { token: { t: prev.token, w: prev.witness, e: EPOCH - 1 }, device_pubkey: device.spki })).status,
+      200, 'a token from the PREVIOUS epoch is still accepted — rotation is not a cliff');
+
+    const old = mintForEpoch(EPOCH - 2)[0];
+    eq((await post('/api/credentials', { token: { t: old.token, w: old.witness, e: EPOCH - 2 }, device_pubkey: device.spki })).status,
+      403, 'a token two epochs old is refused on its own terms, spend record or not');
+
+    const future = mintForEpoch(EPOCH + 1)[0];
+    eq((await post('/api/credentials', { token: { t: future.token, w: future.witness, e: EPOCH + 1 }, device_pubkey: device.spki })).status,
+      403, 'a token claiming a future epoch is refused');
+
+    const t = mintForEpoch(EPOCH)[0];
+    eq((await post('/api/credentials', { token: { t: t.token, w: t.witness, e: EPOCH - 1 }, device_pubkey: device.spki })).status,
+      403, 'lying about which epoch a token came from fails verification');
+    eq((await post('/api/credentials', { token: { t: t.token, w: t.witness }, device_pubkey: device.spki })).status,
+      403, 'a token with no epoch is refused');
+    eq((await post('/api/credentials', { token: { t: t.token, w: t.witness, e: 'now' }, device_pubkey: device.spki })).status,
+      403, 'a non-integer epoch is refused');
+    eq((await post('/api/credentials', { token: { t: t.token, w: t.witness, e: EPOCH }, device_pubkey: device.spki })).status,
+      200, 'and the same token under its real epoch is accepted');
+  }
+
   section('adversarial — every one of these MUST fail');
 
   {
@@ -195,13 +246,13 @@ try {
 
   {
     const { tokens: tt } = await getTokens(device, 2);
-    const bad = { t: tt[0].token, w: tt[1].witness };
+    const bad = { t: tt[0].token, w: tt[1].witness, e: EPOCH };
     eq((await post('/api/credentials', { token: bad, device_pubkey: device.spki })).status, 403,
       'a token presented with a mismatched witness is rejected');
-    const tampered = { t: tt[0].token, w: 'f'.repeat(64) };
+    const tampered = { t: tt[0].token, w: 'f'.repeat(64), e: EPOCH };
     eq((await post('/api/credentials', { token: tampered, device_pubkey: device.spki })).status, 403,
       'a forged witness is rejected');
-    check((await post('/api/credentials', { token: { t: 'zz', w: 'zz' }, device_pubkey: device.spki })).status === 403,
+    check((await post('/api/credentials', { token: { t: 'zz', w: 'zz', e: EPOCH }, device_pubkey: device.spki })).status === 403,
       'a malformed token is rejected');
   }
 
@@ -216,7 +267,7 @@ try {
   }
 
   eq((await post('/admin/nodes', [{ id: 'x' }])).status, 404, 'admin API without a key returns the decoy');
-  eq((await post('/api/credentials', { token: { t: 'a'.repeat(64), w: 'b'.repeat(64) } })).status, 400,
+  eq((await post('/api/credentials', { token: { t: 'a'.repeat(64), w: 'b'.repeat(64), e: EPOCH } })).status, 400,
     'credentials without a device public key are refused, not silently unbound');
   eq((await post('/admin/nodes', [{ id: 'x' }], { 'x-admin-key': 'wrong' })).status, 404,
     'admin API with a wrong key returns the decoy');
@@ -237,6 +288,40 @@ try {
     const { raw, items } = await getTokens(device, 2).then((r) => r);
     unblind(items, raw.evaluated, { e: raw.proof.e, s: '00'.repeat(32) }, raw.public_key);
   }, 'unblind() throws on a tampered DLEQ proof from the live server');
+
+  section('2.8 — attribution survives concurrency');
+  {
+    // Many clients being assigned the same node at once. Under KV each read the
+    // index without the others' entries and all but one append was lost, so
+    // those lineages escaped attribution entirely.
+    // A node of its own, so the count is exactly the lineages created here and
+    // not the ones earlier sections left holding node0001.
+    await post('/admin/nodes', [
+      { id: 'node0005', pool: 'sacrificial', status: 'active', ip: '203.0.113.50',
+        users: [{ id: '55555555-5555-5555-5555-555555555555' }],
+        tier_d_reality: { port: 443, flow: 'xtls-rprx-vision', dest: 'www.iana.org',
+                          public_key: 'PBK', short_ids: ['cd'] } },
+    ], { 'x-admin-key': ADMIN_KEY });
+
+    const devices = await Promise.all(Array.from({ length: 6 }, () => makeDevice()));
+    const lineages = [];
+    for (const [i, dev] of devices.entries()) {
+      const { tokens: tk } = await getTokens(dev, 2, `10.1.0.${i}`);
+      const res = await post('/api/credentials',
+        { token: { t: tk[0].token, w: tk[0].witness, e: EPOCH }, device_pubkey: dev.spki });
+      lineages.push((await res.json()).lineage);
+    }
+    check(lineages.length === 6 && new Set(lineages).size === 6, 'six distinct lineages hold node0005');
+
+    const burn = await post('/admin/report-blocked', { node_id: 'node0005' }, { 'x-admin-key': ADMIN_KEY });
+    const burnJson = await burn.json();
+    eq(burnJson.implicated, 6, 'every lineage that held the burned node is implicated, none lost');
+    eq(burnJson.weight, 0.5, 'a sacrificial-pool burn carries the lightest weight');
+
+    const again = await post('/admin/report-blocked', { node_id: 'node0005' }, { 'x-admin-key': ADMIN_KEY });
+    eq((await again.json()).implicated, 0,
+      'a second burn of the same node implicates nobody twice — the index is drained atomically');
+  }
 
   section('retention — rate-limit rows must not become a log');
   {
@@ -264,7 +349,7 @@ try {
     // API, not accept a one-character sentinel as the key.
     const unconfigured = await unstable_dev('distributor-worker.js', {
       config: 'wrangler.toml', local: true, persistTo: `${PERSIST}-nokey`,
-      vars: { KEY_SALT: 'b2'.repeat(32), VOPRF_SK: voprfKey.secret },
+      vars: { KEY_SALT: 'b2'.repeat(32), VOPRF_MASTER: voprfMaster },
       experimental: { disableExperimentalWarning: true },
     });
     try {

@@ -59,7 +59,7 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 206 checks; PYTHON=<venv>/bin/python if your
+./test/run-all.sh          # 220 checks; PYTHON=<venv>/bin/python if your
                            # system python lacks `cryptography`.
                            # Suites 6 and 7 need nginx and are SKIPPED loudly
                            # without it: apt-get install -y nginx-light
@@ -81,7 +81,9 @@ wrangler kv namespace create NODES
 wrangler secret put ADMIN_KEY        # generate: openssl rand -hex 32
 wrangler secret put KEY_SALT         # openssl rand -hex 32 — NEVER ROTATE,
                                      # and it MUST DIFFER from ADMIN_KEY
-wrangler secret put VOPRF_SK         # npm run keygen:voprf
+wrangler secret put VOPRF_MASTER     # npm run keygen:voprf
+                                     # per-epoch keys derive from this;
+                                     # there is NO rotation ceremony
 wrangler deploy
 ```
 

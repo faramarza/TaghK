@@ -13,7 +13,7 @@
   "scripts": {
     "deploy:distributor": "wrangler deploy -c wrangler.toml",
     "deploy:collector": "wrangler deploy -c wrangler.collector.toml",
-    "keygen:voprf": "node -e \"import('./voprf.js').then(m=>console.log(JSON.stringify(m.generateKey(),null,2)))\"",
+    "keygen:voprf": "node -e \"import('./voprf.js').then(m=>{console.log('VOPRF_MASTER (secret) \u2014 per-epoch keys derive from this:');console.log(m.generateMaster())})\"",
     "keygen:manifest": "node -e \"const{generateKeyPairSync}=require('crypto');const{publicKey,privateKey}=generateKeyPairSync('ed25519');console.log('MANIFEST_SK (secret, base64 pkcs8):');console.log(privateKey.export({type:'pkcs8',format:'der'}).toString('base64'));console.log('\\nOPERATOR_PUBKEY (pin into probe agents, base64 raw):');console.log(publicKey.export({type:'spki',format:'der'}).subarray(12).toString('base64'));\"",
     "test": "./test/run-all.sh",
     "test:crypto": "node selftest.mjs",
