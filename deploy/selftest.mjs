@@ -9,6 +9,7 @@
  *   npm install && node selftest.mjs
  */
 import * as v from './voprf.js';
+import { commitmentKeypair, mint, anchorFor } from './test/anchor-helper.mjs';
 
 let fail = 0;
 const check = (ok, label) => { console.log(`${ok ? '\x1b[32m✓\x1b[0m' : '\x1b[31m✗\x1b[0m'} ${label}`); if (!ok) fail++; };
@@ -16,25 +17,51 @@ const check = (ok, label) => { console.log(`${ok ? '\x1b[32m✓\x1b[0m' : '\x1b[
 const kp = v.generateKey();
 check(kp.secret.length === 64 && kp.public.length === 64, 'keygen produces well-formed key material');
 
+// Issuance is anchored: the client checks the issuer key against a commitment
+// signed by a key pinned in its build before it verifies anything else. There
+// is no unanchored mode — see commitment.js and 04-STATUS.md 2.17.
+const master = v.generateMaster();
+const EPOCH = v.currentEpoch();
+const operator = commitmentKeypair();
+const commitment = await mint({ master, pkcs8: operator.pkcs8, span: 2, serial: 1 });
+const anchor = anchorFor(EPOCH, commitment, operator.pinnedKey);
+const epochSecret = v.deriveEpochKey(master, EPOCH);
+check(v.epochPublicKey(master, EPOCH) === v.issue(epochSecret, [v.blind(1)[0].blinded]).public_key,
+  'the epoch public key matches what issuance advertises');
+
 const items = v.blind(8);
-const res = v.issue(kp.secret, items.map((i) => i.blinded));
+const res = v.issue(epochSecret, items.map((i) => i.blinded));
 check(res.evaluated.length === 8, 'batch issuance evaluates every element');
 
 let tokens;
-try { tokens = v.unblind(items, res.evaluated, res.proof, res.public_key); check(true, 'DLEQ proof verifies; tokens unblind'); }
-catch { check(false, 'DLEQ proof verifies; tokens unblind'); tokens = []; }
+try { tokens = await v.unblind(items, res.evaluated, res.proof, res.public_key, anchor); check(true, 'anchored issuance verifies; tokens unblind'); }
+catch (e) { check(false, `anchored issuance verifies; tokens unblind (${e.message})`); tokens = []; }
 
-check(tokens.every((t) => v.verifyToken(kp.secret, t.token, t.witness)), 'every token verifies under the issuing key');
+check(tokens.every((t) => v.verifyToken(epochSecret, t.token, t.witness)), 'every token verifies under the issuing key');
 
-// A tampered proof MUST be rejected — this is the anti-tagging guarantee.
+// A tampered proof MUST be rejected.
 let rejected = false;
-try { v.unblind(items, res.evaluated, { e: res.proof.e, s: '00'.repeat(32) }, res.public_key); }
+try { await v.unblind(items, res.evaluated, { e: res.proof.e, s: '00'.repeat(32) }, res.public_key, anchor); }
 catch { rejected = true; }
-check(rejected, 'tampered DLEQ proof is rejected (anti-tagging holds)');
+check(rejected, 'tampered DLEQ proof is rejected');
+
+// A valid proof under a key the operator never committed to MUST be rejected.
+// This is the check that actually carries the anti-tagging guarantee.
+const attacker = v.generateKey();
+const evil = v.issue(attacker.secret, items.map((i) => i.blinded));
+let tagged = false;
+try { await v.unblind(items, evil.evaluated, evil.proof, evil.public_key, anchor); }
+catch { tagged = true; }
+check(tagged, 'a per-user issuer key is rejected even with a valid proof (anti-tagging holds)');
+
+let unanchored = false;
+try { await v.unblind(items, res.evaluated, res.proof, res.public_key); }
+catch { unanchored = true; }
+check(unanchored, 'there is no unanchored unblind path');
 
 const kp2 = v.generateKey();
 check(!v.verifyToken(kp2.secret, tokens[0].token, tokens[0].witness), 'token from another key is rejected');
-check(!v.verifyToken(kp.secret, tokens[0].token, tokens[1].witness), 'mismatched witness is rejected');
+check(!v.verifyToken(epochSecret, tokens[0].token, tokens[1].witness), 'mismatched witness is rejected');
 
 check(v.spendKey(tokens[0].token, 'p') === v.spendKey(tokens[0].token, 'p'), 'spend key is deterministic');
 check(v.spendKey(tokens[0].token, 'p') !== v.spendKey(tokens[0].token, 'q'), 'spend key depends on the pepper');

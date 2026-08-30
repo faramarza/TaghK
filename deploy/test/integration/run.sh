@@ -43,6 +43,8 @@ export COLLECTOR_URL=https://127.0.0.1:9444
 export ADMIN_KEY=$(jq -r .admin_key <<<"$READY")
 export COLLECTOR_ADMIN=$(jq -r .collector_admin <<<"$READY")
 export OPERATOR_PUBKEY=$(jq -r .operator_pubkey <<<"$READY")
+# Pinned in a real client build; passed to the harness client here.
+export COMMITMENT_PK=$(jq -r .commitment_pk <<<"$READY")
 export SSL_CERT_FILE="$TLS_DIR/certs/ca.pem"
 export NODE_EXTRA_CA_CERTS="$TLS_DIR/certs/ca.pem"
 export NO_PROXY=localhost,127.0.0.1 no_proxy=localhost,127.0.0.1

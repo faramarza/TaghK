@@ -23,6 +23,7 @@
     "test:collector": "node test/collector.test.mjs",
     "build:canary-pool": "node tools/build-canary-pool.mjs",
     "test:node-config": "./test/bootstrap-config.test.sh",
-    "test:integration": "./test/integration/run.sh"
+    "test:integration": "./test/integration/run.sh",
+    "test:anchor": "node test/anchor.test.mjs"
   }
 }

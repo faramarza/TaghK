@@ -85,6 +85,13 @@
  *   Secret  VOPRF_MASTER  VOPRF master secret. Per-epoch keys are DERIVED from
  *                        it (voprf.js); it is never used to sign anything
  *                        directly. Generate with `npm run keygen:voprf`.
+ *
+ * DELIBERATELY ABSENT: the key-commitment signing key. This Worker serves a
+ * pre-signed commitment it cannot produce, so a compromise here cannot make a
+ * client accept an issuer key the offline holder never committed to — which is
+ * the only thing standing between a compromised distributor and per-user
+ * tagging. See commitment.js and docs/adr/0006. Do not add COMMITMENT_SK here
+ * for any reason, including convenience during an incident.
  */
 
 import { issue, verifyToken as voprfVerify, spendKey, timingSafeEqual,
@@ -146,6 +153,7 @@ export default {
     const path = new URL(request.url).pathname;
     try {
       switch (true) {
+        case path === '/api/keys':             return await keyCommitment(request, env);
         case path === '/api/challenge':        return await getChallenge(request, env);
         case path === '/api/issue':            return await issueTokens(request, env);
         case path === '/api/credentials':      return await getCredentials(request, env);
@@ -155,6 +163,7 @@ export default {
         case path === '/admin/report-blocked': return await adminReportBlocked(request, env, ctx);
         case path === '/admin/stats':          return await adminStats(request, env);
         case path === '/admin/fallbacks':      return await adminFallbacks(request, env);
+        case path === '/admin/commitment':     return await adminCommitment(request, env);
 
         default:                               return decoy();
       }
@@ -239,6 +248,75 @@ async function rateLimited(request, env, bucket, max) {
   const window = Math.floor(Date.now() / 1000 / CFG.RATE_WINDOW_S);
   const key = `rl:${bucket}:${window}:${await peppered(env, 'rl', hint)}`;
   return overLimit(env.RATE_LIMITER, key, max, CFG.RATE_WINDOW_S);
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Key commitment — served, never signed here
+// ───────────────────────────────────────────────────────────────────────────
+
+/**
+ * Public. Every client fetches this and anchors its issuance against it.
+ *
+ * It is an opaque blob to this Worker: served byte-for-byte as uploaded, and
+ * unforgeable here because the signing key is offline. Cached briefly at the
+ * edge — it is identical for every client, and it MUST be, since a per-client
+ * commitment is precisely the attack (commitment.js).
+ */
+async function keyCommitment(request, env) {
+  if (request.method !== 'GET') return decoy();
+  const raw = await env.NODES.get('commitment');
+  if (!raw) return decoy();
+  return new Response(raw, {
+    headers: {
+      'content-type': 'application/json',
+      'cache-control': 'public, max-age=300',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+    },
+  });
+}
+
+/** Load the commitment and report which epochs it covers. */
+async function commitmentState(env) {
+  try {
+    const raw = await env.NODES.get('commitment');
+    if (!raw) return null;
+    const { doc } = JSON.parse(raw);
+    const parsed = JSON.parse(doc);
+    return {
+      serial: parsed.serial,
+      epochs: Object.keys(parsed.keys).map(Number).sort((a, b) => a - b),
+      not_after: parsed.not_after,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function adminCommitment(request, env) {
+  if (!authed(request, env)) return decoy();
+  if (request.method === 'GET') return json((await commitmentState(env)) ?? { error: 'none' });
+
+  const body = await readJson(request);
+  if (!body || typeof body.doc !== 'string' || typeof body.signature !== 'string') return decoy();
+
+  // Validated for SHAPE only. This Worker cannot check the signature — it has
+  // no pinned key and should not have one; verification is the client's job and
+  // the client is the party that matters. What we can do is refuse to store
+  // something obviously unusable, and refuse a rollback.
+  let parsed;
+  try { parsed = JSON.parse(body.doc); } catch { return json({ error: 'invalid' }, 400); }
+  if (parsed?.v !== 1 || !Number.isSafeInteger(parsed.serial) || !parsed.keys) {
+    return json({ error: 'invalid' }, 400);
+  }
+
+  const existing = await commitmentState(env);
+  if (existing && parsed.serial <= existing.serial) {
+    return json({ error: 'stale', have: existing.serial, offered: parsed.serial }, 409);
+  }
+
+  await env.NODES.put('commitment', JSON.stringify({ doc: body.doc, signature: body.signature }));
+  return json({ ok: true, ...(await commitmentState(env)) });
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -380,6 +458,18 @@ async function issueTokens(request, env) {
   // the client can present it at redemption and the server knows which key to
   // check against.
   const epoch = currentEpoch();
+
+  // FAIL CLOSED if no published commitment covers this epoch.
+  //
+  // Tokens issued outside a commitment are tokens a correct client must throw
+  // away, so issuing them helps nobody and hides an operator error behind a
+  // client-side failure that looks like tampering. Refusing here makes the
+  // fault visible on the operator's side, where it can be fixed.
+  //
+  // The cost is real and is the operator's to carry: forget to re-mint and
+  // issuance stops. Mint several epochs ahead — 02-RUNBOOK.md §2.
+  const commitment = await commitmentState(env);
+  if (!commitment || !commitment.epochs.includes(epoch)) return json({ error: 'invalid' }, 503);
   let result;
   try {
     result = issue(deriveEpochKey(env.VOPRF_MASTER, epoch), blinded, CFG.MAX_BLIND_BATCH);
@@ -748,8 +838,17 @@ async function adminFallbacks(request, env) {
 async function adminStats(request, env) {
   if (!authed(request, env)) return decoy();
   const inventory = JSON.parse((await env.NODES.get('inventory')) || '[]');
+  const commitment = await commitmentState(env);
+  const epoch = currentEpoch();
   return json({
     nodes: inventory.length,
+    // Operator health only. If this says issuing:false, /api/issue is returning
+    // 503 and nobody can enrol — re-mint and upload before anything else.
+    key_commitment: commitment
+      ? { serial: commitment.serial, covers_epochs: commitment.epochs,
+          current_epoch: epoch, issuing: commitment.epochs.includes(epoch),
+          epochs_of_headroom: commitment.epochs.filter((e) => e > epoch).length }
+      : { present: false, issuing: false, current_epoch: epoch },
     by_pool: Object.fromEntries(
       POOLS.map((p) => [p, {
         active: inventory.filter((n) => n.pool === p && n.status === 'active').length,

@@ -59,7 +59,7 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 220 checks; PYTHON=<venv>/bin/python if your
+./test/run-all.sh          # 260 checks; PYTHON=<venv>/bin/python if your
                            # system python lacks `cryptography`.
                            # Suites 6 and 7 need nginx and are SKIPPED loudly
                            # without it: apt-get install -y nginx-light
@@ -86,6 +86,47 @@ wrangler secret put VOPRF_MASTER     # npm run keygen:voprf
                                      # there is NO rotation ceremony
 wrangler deploy
 ```
+
+#### The key commitment — do this before the first user, and quarterly after
+
+Clients refuse any issuer key that is not named in a commitment signed by a key
+they pin at build time. Without it a compromised distributor could hand each
+user a different key and de-anonymise them at redemption (03-SECURITY.md §2.3).
+
+**`COMMITMENT_SK` NEVER GOES ON THE WORKER.** That is the entire security
+property: the Worker serves a blob it cannot forge. Generate and use it on a
+machine that is not the server.
+
+```bash
+# ONCE, offline. Pin the printed COMMITMENT_PK into every client build and
+# publish it through at least two independent channels.
+node tools/mint-commitment.mjs --keygen
+
+# QUARTERLY, offline. Covers the current epoch and the next two (~90 days).
+VOPRF_MASTER=... COMMITMENT_SK=... \
+  node tools/mint-commitment.mjs --epochs 3 --prev-doc last-commitment.json \
+  > commitment.json
+
+# Upload the signed blob. Keep commitment.json — the next mint chains to it.
+curl -X POST https://dist.<you>.workers.dev/admin/commitment \
+  -H "x-admin-key: $ADMIN_KEY" -H 'content-type: application/json' \
+  -d @commitment.json
+```
+
+**Issuance FAILS CLOSED without a current commitment** — `/api/issue` returns
+503 and nobody can enrol. That is deliberate: tokens issued outside a commitment
+are tokens a correct client must throw away. Check your headroom:
+
+```bash
+curl -s -H "x-admin-key: $ADMIN_KEY" .../admin/stats | jq .key_commitment
+# { "serial": 3, "issuing": true, "epochs_of_headroom": 2, ... }
+```
+
+**If `issuing` is false, no new user can enrol.** Re-mint and upload before
+anything else. Set a calendar reminder for `epochs_of_headroom <= 1`.
+
+Uploading a commitment whose serial is not greater than the stored one is
+refused with 409 — the server will not roll back, and neither will a client.
 
 **All three secrets are required.** The Worker refuses the operator API
 outright when `ADMIN_KEY` is absent rather than falling back to anything, so a

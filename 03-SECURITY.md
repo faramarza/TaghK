@@ -49,18 +49,36 @@ its own renewals. What it can never be followed to is a human being. That is the
 strongest achievable position while retaining any ability to respond to leaks,
 and claiming more would be dishonest.
 
-### 2.3 Why the DLEQ proof is mandatory
+### 2.3 Why the DLEQ proof is mandatory — and why it is not sufficient alone
 
 Without a proof of correct evaluation, a compromised server can use a **different
 secret key per user**. At redemption it tries each key, sees which matches, and
 has de-anonymised that user completely.
 
-The Chaum–Pedersen batch proof forces the server to demonstrate it used the one
-advertised public key, so every token in existence shares a single anonymity set.
+The Chaum–Pedersen batch proof forces the server to demonstrate it used one
+consistent public key.
 
-> **A VOPRF deployment where the client skips DLEQ verification provides no
-> anonymity against the server at all.** `unblind()` throws rather than
-> proceeding — this is deliberate and must not be softened.
+> **CORRECTION.** An earlier version of this section said the proof forces the
+> server to use "the one advertised public key". That was wrong in a way that
+> mattered, and the code matched the wrong version: the client verified the
+> proof against the public key **that arrived in the same response**. A server
+> using a distinct key per user produces a perfectly valid proof against its own
+> key, and the check passes. Verification of that shape provides no anonymity
+> guarantee whatsoever — it proves internal consistency, not that everyone got
+> the same key. See 04-STATUS.md 2.17.
+
+The guarantee requires **two** checks, both mandatory, both fatal:
+
+1. **ANCHOR.** Is this public key the one the operator committed to for this
+   epoch, in a document signed by a key pinned in the client build? The
+   commitment is served by the distributor but signed **offline** — see §2.5.
+2. **DLEQ.** Did the server actually evaluate under that key?
+
+> **A VOPRF deployment where the client skips either check provides no anonymity
+> against the server at all.** `unblind()` requires the anchor and throws
+> without it. There is no unanchored mode, deliberately: an optional anchor is
+> an anchor that gets skipped, and the resulting client looks identical to a
+> correct one while protecting nobody.
 
 ### 2.4 Probe tokens — a documented weaker choice
 
@@ -82,6 +100,43 @@ manager and no dependency fetch. Pure-Python ristretto255 is not a reasonable as
 there. This is a deliberate trade with a documented upgrade path, not an oversight.
 
 ---
+
+### 2.5 The key commitment, and where its signing key lives
+
+The operator publishes a document naming the VOPRF public key for each epoch,
+signed with a long-term Ed25519 key. Clients pin the verification key at build
+time and refuse any issuer key not committed there.
+
+**`COMMITMENT_SK` is generated offline, kept offline, and never placed on the
+Worker.** The Worker stores and serves a pre-signed blob it cannot produce. That
+single placement decision is what separates two very different claims:
+
+| If the Worker signed on demand | Because the Worker cannot sign |
+|---|---|
+| A compromised Worker mints a per-user commitment. Tagging still works and the signature proves nothing. | A compromised Worker **cannot tag**. It can refuse service, serve stale keys, or serve garbage a client rejects — but it cannot make a client accept a key the offline holder never committed to. |
+
+"Malicious server (us, compromised)" is a named adversary in §1, and this is
+what actually answers it.
+
+**What this does NOT solve, stated separately because it is weaker:** an
+operator holding `COMMITMENT_SK` can sign a commitment naming a per-user key and
+serve it to one client. Signing stops a compromised *server* equivocating; it
+cannot stop the *key holder*, and nothing cryptographic can, because the key
+holder is by definition authorised. The design makes equivocation leave
+evidence instead:
+
+- each document carries a monotonic `serial` and the hash of its predecessor,
+  so the published history is a chain;
+- clients refuse a serial below the highest they have accepted, so a targeted
+  document cannot be a silent rollback;
+- the document is byte-identical for every client and published at a stable
+  location, intended to be mirrored outside the operator's control, so two
+  clients comparing what they received detect a split.
+
+That is detection, not prevention. It closes only with reproducible signed
+client builds (§7, P7) and an independent mirror. Until both exist the honest
+claim is: **a compromised server cannot tag; a malicious operator can, but not
+invisibly, and not to a client that has already seen a later document.**
 
 ## 3. Hardening register
 
@@ -193,6 +248,7 @@ Each plane holds different secrets. Compromise of one must not yield another.
 | `ADMIN_KEY` | Distributor | Quarterly | Rotate immediately — **safe**, because `KEY_SALT` is separate and hashes survive |
 | `KEY_SALT` | Distributor | **Never** | Rotating invalidates all stored digests. Treat as permanent. |
 | `VOPRF_MASTER` | Distributor | On compromise only | Every epoch key derives from it, past and future, so compromise invalidates all outstanding tokens and users must re-enrol. Per-epoch keys are derived, never stored, and never rotated by hand. |
+| `COMMITMENT_SK` | **NOBODY — offline only** | Never, if avoidable | **The most dangerous secret in the system and the only one that must never touch a server.** Holding it is the ability to name a per-user issuer key and have clients accept it. Keep it offline, on hardware, ideally split. Rotating it requires shipping a new client build to every user, so treat it as permanent and protect it accordingly. |
 | `PROBE_HMAC_KEY` | Collector | Quarterly | All probe tokens invalid; probes must re-enrol |
 | `MANIFEST_SK` | Collector | On compromise only | **Critical** — an attacker can direct volunteers' devices. Rotate and push a client update immediately. |
 | `COLLECTOR_ADMIN` | Collector | Quarterly | Rotate |
@@ -230,6 +286,14 @@ Do not serve real users until every line is true.
 ```
 [ ] KEY_SALT generated and DISTINCT from ADMIN_KEY
 [ ] VOPRF_MASTER generated via voprf.js generateMaster()
+[ ] COMMITMENT_SK generated OFFLINE via tools/mint-commitment.mjs --keygen
+[ ] COMMITMENT_SK confirmed absent from every Worker, CI system, and repo
+[ ] COMMITMENT_PK pinned into the client build and published through at least
+    two independent channels
+[ ] A signed key commitment uploaded and covering at least three epochs ahead
+    (issuance FAILS CLOSED without one — check /admin/stats key_commitment)
+[ ] Client confirmed to refuse an issuer key outside the commitment — test with
+    a deliberately wrong pinned key, do not assume
 [ ] MANIFEST_SK generated; public key PINNED into every probe agent build
 [ ] Distributor and collector on SEPARATE Workers, KV namespaces, admin keys
 [ ] Client verifies DLEQ proofs — confirm unblind() throws on a tampered proof

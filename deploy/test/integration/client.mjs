@@ -19,6 +19,10 @@
 import { createHash, webcrypto } from 'node:crypto';
 import { blind, unblind } from '../../voprf.js';
 
+// Pinned at build time in a real client. Passed in here because this harness is
+// rebuilt per run; a shipped client must NOT take it from the environment.
+const PINNED_COMMITMENT_KEY = process.env.COMMITMENT_PK || '';
+
 const [cmd, base, ...rest] = process.argv.slice(2);
 const b64 = (b) => Buffer.from(b).toString('base64');
 
@@ -56,8 +60,18 @@ if (cmd === 'enrol') {
   if (res.status !== 200) { console.error(`issue failed: ${res.status}`); process.exit(1); }
   const out = await res.json();
 
-  // Throws rather than degrading if the server used a per-user key (I2).
-  const tokens = unblind(items, out.evaluated, out.proof, out.public_key);
+  // Anchor the issuer key against the operator's signed commitment BEFORE
+  // trusting the proof. Without this, a server that uses a distinct key per
+  // user produces a valid proof and identifies that user at redemption
+  // (04-STATUS.md 2.17). Throws rather than degrading (I2).
+  const keys = await (await fetch(`${base}/api/keys`)).json();
+  const tokens = await unblind(items, out.evaluated, out.proof, out.public_key, {
+    epoch: out.epoch,
+    doc: keys.doc,
+    signature: keys.signature,
+    pinnedKey: PINNED_COMMITMENT_KEY,
+    minSerial: Number(process.env.MIN_COMMITMENT_SERIAL || 0),
+  });
 
   const cred = await post('/api/credentials', {
     // The epoch travels with the token; the server uses it to pick the key.

@@ -10,6 +10,7 @@ import { unstable_dev } from 'wrangler';
 import { generateKeyPairSync } from 'node:crypto';
 import { rmSync } from 'node:fs';
 import { generateMaster, currentEpoch, epochPublicKey } from '../../voprf.js';
+import { commitmentKeypair, mint } from '../anchor-helper.mjs';
 
 const PERSIST = process.env.PERSIST_DIR || '/tmp/tk-integration';
 const DIST_PORT = Number(process.env.DIST_PORT || 8787);
@@ -19,6 +20,12 @@ rmSync(PERSIST, { recursive: true, force: true });
 
 const voprfMaster = generateMaster();
 const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+
+// The key-commitment keypair. Its secret NEVER enters the Worker's vars — it is
+// used here only to mint the document that is then uploaded as an opaque blob,
+// which is exactly how an operator does it offline (docs/adr/0006).
+const operator = commitmentKeypair();
+const commitment = await mint({ master: voprfMaster, pkcs8: operator.pkcs8, span: 3, serial: 1 });
 
 const env = {
   ADMIN_KEY: 'ad'.repeat(32),
@@ -45,6 +52,19 @@ const coll = await unstable_dev('collector-worker.js', {
   },
 });
 
+// Upload the pre-signed commitment. Without it the distributor refuses to
+// issue — deliberately, since tokens outside a commitment are tokens a correct
+// client must discard.
+const uploaded = await dist.fetch('http://d/admin/commitment', {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-admin-key': env.ADMIN_KEY },
+  body: JSON.stringify(commitment),
+});
+if (uploaded.status !== 200) {
+  console.error(`commitment upload failed: ${uploaded.status}`);
+  process.exit(1);
+}
+
 console.log(JSON.stringify({
   ready: true,
   dist_port: DIST_PORT,
@@ -53,6 +73,7 @@ console.log(JSON.stringify({
   collector_admin: env.COLLECTOR_ADMIN,
   operator_pubkey: publicKey.export({ type: 'spki', format: 'der' }).subarray(12).toString('base64'),
   voprf_public: epochPublicKey(voprfMaster, currentEpoch()),
+  commitment_pk: operator.pinnedKey,
 }));
 
 const shutdown = async () => {

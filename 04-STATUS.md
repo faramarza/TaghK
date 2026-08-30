@@ -252,6 +252,39 @@ The value also derived from a caller-controlled `Host` header.
 the base URL it already contacted. It never trusts the server to tell it its own
 address.
 
+#### 2.17 DLEQ verification did not prevent tagging — *was critical, closed*
+
+**A security property the documents asserted did not hold as implemented.**
+Found while implementing key epochs, by asking what the client actually
+verifies the proof *against*.
+
+The client verified the batched proof against the public key that arrived in
+the same response. That proves the server used *some* key consistently, not that
+it used *everyone's*. A malicious or compromised distributor picks a distinct
+`k_user` per client, evaluates under it, produces a perfectly valid proof
+against `Y_user`, and at redemption tries each stored key until one matches —
+identifying that user exactly. Precisely the attack the proof exists to stop.
+I2 was **verified but not anchored**.
+
+**Closed by** ADR-0006. The operator publishes an epoch key commitment signed
+with a long-term key that clients pin at build time; `unblind()` refuses any
+issuer key not named there, and refuses to run at all without an anchor.
+
+**The load-bearing part is where the signing key lives: `COMMITMENT_SK` never
+touches the Worker.** The Worker serves a pre-signed blob it cannot produce, so
+a compromised distributor cannot tag — it can refuse service or serve garbage a
+client rejects, but it cannot make a client accept a key the offline holder
+never committed to. That is what finally answers the "malicious server (us,
+compromised)" adversary named in 03-SECURITY.md §1.
+
+**Demonstrated, not asserted.** `test/anchor.test.mjs` builds a working attacker
+whose proof verifies under its own key, and shows the anchored client refusing
+it. `test/integration/plane3.py` runs the same client with a wrong pinned key
+and with no pinned key, and both refuse an issuance the honest client accepts —
+because a skipped anchor would otherwise look identical to a working one.
+
+**Residual, and it is weaker — see 2.18.**
+
 #### 2.16 The node forwarded a client address into Xray — *new, closed*
 
 `bootstrap.sh` set `proxy_set_header X-Real-IP $remote_addr` on the WebSocket
@@ -294,60 +327,35 @@ found. That provider shortlist is now open work — see
 
 ### OPEN
 
-#### 2.17 DLEQ verification does not prevent tagging unless the issuer public key is pinned — **critical**
+#### 2.18 A malicious operator can still equivocate on the key commitment — *open, needs P7*
 
-**A security property the documents assert does not hold as implemented.**
-Found while implementing key epochs, by asking what the client actually
-verifies the proof *against*.
+The residual of 2.17, recorded separately because it is a materially weaker
+property than the one that was closed.
 
-`/api/issue` returns `{evaluated, proof, public_key}`. The client calls
-`unblind(items, evaluated, proof, public_key)`, which verifies the batched
-Chaum–Pedersen proof **against the public key that came in the same response.**
+An operator holding `COMMITMENT_SK` can sign a commitment naming a per-user
+issuer key and serve it to one client. Signing prevents a compromised **server**
+from equivocating. It cannot prevent the **key holder** from equivocating, and
+nothing cryptographic can — the key holder is by definition authorised.
 
-That check proves the server used *some* key consistently. It does not prove the
-server used *everyone's* key. A malicious or compromised server picks a distinct
-`k_user` per client, evaluates under it, and produces a perfectly valid DLEQ
-proof with respect to `Y_user = G·k_user`. `verifyBatch()` returns true. At
-redemption the server tries each stored `k_user` until one verifies, and has
-identified the user exactly.
+What exists today makes it leave evidence: monotonic serials plus a hash chain
+over predecessors, client-side rollback refusal, and a byte-identical document
+served from a stable public location.
 
-**This is the precise attack the DLEQ proof exists to stop**, described at the
-top of `voprf.js` and asserted in 03-SECURITY.md §2.3 — "forces the server to
-demonstrate it used the one advertised public key, so every token in existence
-shares one anonymity set". The word doing the work is *advertised*, and nothing
-in the system currently makes the advertised key anything other than whatever
-the server said this time.
+What is missing to make that evidence usable:
 
-So invariant I2 is, today, **verified but not anchored**: `unblind()` correctly
-throws on a tampered proof, and that is worth having, but it is not yet the
-anti-tagging guarantee the architecture claims.
+1. **Reproducible, signed client builds (P7)** so the pinned key is verifiably
+   the one in the published source. A pinned key nobody can check is a promise.
+2. **An independent mirror** of the commitment document, outside the operator's
+   control, so a client or a researcher can compare what they were served.
+3. **A published comparison procedure**, in Persian, that a non-technical user
+   or a local technologist can actually follow.
 
-**Why it has not bitten:** there is no client. The only consumer is
-`test/distributor.test.mjs`, which does pin — it checks
-`public_key === epochPublicKey(master, epoch)` because it generated the master.
-A real client cannot do that.
+Until all three exist the honest claim is: *a compromised server cannot tag; a
+malicious operator can, but not invisibly, and not to a client that has already
+seen a later commitment.* Do not state it more strongly than that in any
+user-facing material.
 
-**What a fix requires** (this is a design decision, not a patch, and it is
-escalated rather than chosen here):
-
-1. The client must know the canonical issuer key independently of the issuance
-   response. Standard answers are pinning it in the reproducible, signed client
-   build (P7), or fetching a signed key-commitment document.
-2. Epochs make a single pinned key insufficient, since the key legitimately
-   changes. The usual construction is a long-term commitment key pinned in the
-   build, which signs the list of epoch public keys.
-3. Signing alone is not sufficient either: an operator can sign a per-user key.
-   Only transparency closes it — the commitment document must be identical for
-   everyone, publicly fetchable, and cross-checkable, so a per-user key is
-   *detectable* even though it is not preventable.
-
-**Consequence for sequencing:** this must be settled before P2 writes the
-client's issuance path, and it makes P7 (reproducible, signed builds) a
-dependency of the anonymity claim rather than a trust nicety.
-
-Until it is settled, the honest statement of what the system provides against a
-malicious server is: **unlinkability by the blind, and tamper-evidence on the
-proof — but not anti-tagging.**
+**This makes P7 a dependency of the anonymity claim, not a trust nicety.**
 
 #### 2.8 Node inventory can still lose concurrent operator writes — *low*
 
@@ -431,12 +439,13 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Largely addressed. `deploy/test/` runs **220 checks across seven suites**:
+Largely addressed. `deploy/test/` runs **260 checks across eight suites**:
 
 | Suite | What it runs |
 |---|---|
 | `selftest.mjs` | the VOPRF core |
 | `kv-race` | a model of KV's eventual consistency; asserts the legacy pattern still fails |
+| `anchor` | key-commitment anchoring, with the per-user-key tagging attack mounted and caught |
 | `canary` | pool invariants |
 | `distributor` | the Worker in workerd, driven through its real API |
 | `collector` | the Worker in workerd + Ed25519 cross-verified by two independent implementations |

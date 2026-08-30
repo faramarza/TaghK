@@ -49,6 +49,7 @@ import { RistrettoPoint } from '@noble/curves/ed25519';
 import { invert, mod } from '@noble/curves/abstract/modular';
 import { sha512 } from '@noble/hashes/sha512';
 import { sha256 } from '@noble/hashes/sha256';
+import { anchorEpochKey } from './commitment.js';
 
 /** Order of the ristretto255 group. */
 export const L = 2n ** 252n + 27742317777372353535851937790883648493n;
@@ -383,9 +384,41 @@ export function blind(count = 8) {
   return items;
 }
 
-export function unblind(items, evaluatedHex, proof, publicKey) {
-  // MANDATORY. Skipping this check forfeits anonymity entirely — see the
-  // per-user-key tagging attack described at the top of this file.
+/**
+ * Unblind an issuance. TWO checks, both mandatory, both fatal.
+ *
+ *  1. ANCHOR — is this public key the one the operator committed to for this
+ *     epoch, signed by a key pinned in the client build? Without this, step 2
+ *     proves nothing about anonymity: a server that picks a distinct key per
+ *     user can produce a perfectly valid proof against its own key and identify
+ *     that user at redemption. See commitment.js and 04-STATUS.md 2.17.
+ *
+ *  2. DLEQ — did the server actually evaluate under that key?
+ *
+ * `anchor` is REQUIRED and there is deliberately no way to opt out. An optional
+ * anchor is an anchor that gets skipped in a hurry, and the resulting client
+ * looks identical to a correct one while providing no anonymity at all.
+ *
+ * Returns tokens tagged with their epoch, because a token whose epoch is lost
+ * cannot be redeemed and losing them separately is an easy mistake to make.
+ */
+export async function unblind(items, evaluatedHex, proof, publicKey, anchor) {
+  if (!anchor || typeof anchor !== 'object') {
+    throw new Error(
+      'refusing to unblind without an anchored issuer key. Pass the signed key ' +
+      'commitment; see commitment.js. There is no unanchored mode.'
+    );
+  }
+
+  const { publicKey: committed, serial } = await anchorEpochKey(anchor.epoch, anchor);
+
+  if (typeof publicKey !== 'string' || !timingSafeEqual(fromHex(committed), fromHex(publicKey))) {
+    throw new Error(
+      'issuer key does not match the operator commitment for this epoch — ' +
+      'the server may be tagging users. Discard these tokens.'
+    );
+  }
+
   if (!verifyBatch(publicKey, items.map((i) => i.blinded), evaluatedHex, proof)) {
     throw new Error('DLEQ verification failed — server may be tagging users. Discard these tokens.');
   }
@@ -394,7 +427,10 @@ export function unblind(items, evaluatedHex, proof, publicKey) {
     const rInv = invert(item.blindScalar, L);
     return {
       token: item.token,
+      epoch: anchor.epoch,
       witness: RistrettoPoint.fromHex(evaluatedHex[i]).multiply(rInv).toHex(),
+      // The serial the client must not go below next time (rollback protection).
+      commitment_serial: serial,
     };
   });
 }

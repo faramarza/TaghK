@@ -41,10 +41,11 @@ Everything here serves those three.
 | `deploy/control-plane.py` | Plane 3. Pull-only burn detection, nationwide-event guard, automated replacement. |
 | `deploy/bootstrap.sh` | Provisions one transport node — REALITY (Tier D) + CDN-fronted WebSocket (Tier A) + camouflage site + full host hardening. Idempotent. |
 | `deploy/client-singbox.json` | Plane 4. Client template with automatic tier failover. Zero user decisions. |
+| `deploy/commitment.js` | The key commitment clients anchor against. Its signing key lives **offline**, never on the Worker — see `docs/adr/0006`. |
 | `deploy/durable.js` | Strongly consistent primitives. Token spend records, single-use proof-of-work, probe nonces, rate limiters. These cannot live in KV — see `docs/adr/0001`. |
 | `deploy/canary.js`, `deploy/canary-pool.js` | Canary selection and the generated 246-host bootstrap pool. |
 | `deploy/selftest.mjs` | Cryptographic self-test. **Run before every deployment.** |
-| `deploy/test/` | 220 checks across seven suites. Both Workers driven through their real APIs in the real Workers runtime; the node's generated configs parsed and served; and the burn → attribution → replacement → self-heal loop run end to end with real processes. |
+| `deploy/test/` | 260 checks across eight suites. Both Workers driven through their real APIs in the real Workers runtime; the node's generated configs parsed and served; and the burn → attribution → replacement → self-heal loop run end to end with real processes. |
 | `docs/adr/` | Architecture decision records, including the escalated Cloudflare terms-of-service question. |
 | `deploy/wrangler*.toml`, `package.json` | Deployment config and key generation scripts. |
 

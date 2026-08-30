@@ -147,6 +147,20 @@ check(r.returncode == 0, "client.mjs completes the VOPRF flow with DLEQ verifica
 client = json.loads(r.stdout)
 check(re.fullmatch(r"[0-9a-f]{32}", client["lineage"]) is not None, "client holds a lineage")
 
+# A client built with the WRONG pinned key must refuse the same issuance. This
+# is the end-to-end proof that anchoring is live rather than merely present: if
+# the anchor were skipped, this would succeed identically to the honest client.
+bad = run(["node", "test/integration/client.mjs", "enrol", DIST],
+          {"COMMITMENT_PK": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="})
+check(bad.returncode != 0 and "commitment" in (bad.stderr + bad.stdout).lower(),
+      "a client with a different pinned key refuses the issuance",
+      (bad.stderr.strip().splitlines() or ["(no error)"])[-1][:100])
+
+nokey = run(["node", "test/integration/client.mjs", "enrol", DIST], {"COMMITMENT_PK": ""})
+check(nokey.returncode != 0,
+      "a client with NO pinned key refuses rather than trusting the server",
+      (nokey.stderr.strip().splitlines() or ["(no error)"])[-1][:100])
+
 r = run(["node", "test/integration/client.mjs", "poll", DIST, client["lineage"], client["device_sk"]])
 check(r.returncode == 0, "client polls its subscription with a device signature")
 before = [u for u in r.stdout.strip().splitlines() if u.startswith("vless://")]

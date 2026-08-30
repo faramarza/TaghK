@@ -24,6 +24,7 @@ import { rmSync, readFileSync } from 'node:fs';
 import { section, check, eq, throws, summary } from './harness.mjs';
 import { blind, unblind, verifyBatch, issue as voprfIssue,
          generateMaster, currentEpoch, deriveEpochKey, epochPublicKey } from '../voprf.js';
+import { commitmentKeypair, mint, anchorFor } from './anchor-helper.mjs';
 
 const ADMIN_KEY = 'a1'.repeat(32);
 const PERSIST = `/tmp/tk-dist-${process.pid}`;
@@ -61,6 +62,11 @@ async function makeDevice() {
 // Generated per run, so no key material ever lands in the tree (03-SECURITY §4).
 const voprfMaster = generateMaster();
 const EPOCH = currentEpoch();
+// The commitment signing key exists ONLY here, never in the Worker's vars —
+// that separation is the security property (docs/adr/0006).
+const operator = commitmentKeypair();
+const commitment = await mint({ master: voprfMaster, pkcs8: operator.pkcs8, span: 3, serial: 1 });
+const anchor = () => anchorFor(EPOCH, commitment, operator.pinnedKey);
 
 rmSync(PERSIST, { recursive: true, force: true });
 const w = await unstable_dev('distributor-worker.js', {
@@ -98,11 +104,42 @@ async function getTokens(device, count = 4, hint = '10.0.0.1') {
   }, H);
   if (res.status !== 200) throw new Error(`issue failed: ${res.status}`);
   const out = await res.json();
-  return { tokens: unblind(items, out.evaluated, out.proof, out.public_key), raw: out, items };
+  return { tokens: await unblind(items, out.evaluated, out.proof, out.public_key, anchor()),
+           raw: out, items };
 }
 
 try {
   const device = await makeDevice();
+
+  // ── the commitment must exist before anything can be issued ────────────
+  section('2.17 — issuance fails closed without a published key commitment');
+
+  eq((await w.fetch('http://d/api/keys')).status, 404,
+    'with no commitment published, /api/keys returns the decoy');
+  {
+    const ch0 = await (await w.fetch('http://d/api/challenge', { headers: IP })).json();
+    const res0 = await post('/api/issue', {
+      challenge: ch0.challenge, nonce: solvePow(ch0.challenge, ch0.bits),
+      blinded: blind(1).map((i) => i.blinded),
+      device_pubkey: device.spki, device_sig: await device.sign(ch0.challenge),
+    });
+    eq(res0.status, 503,
+      'and issuance refuses rather than minting tokens no correct client would accept');
+  }
+
+  eq((await post('/admin/commitment', commitment, { 'x-admin-key': ADMIN_KEY })).status, 200,
+    'the operator uploads the offline-signed commitment');
+  eq((await post('/admin/commitment', commitment, { 'x-admin-key': ADMIN_KEY })).status, 409,
+    're-uploading the same serial is refused — the server will not roll back');
+  {
+    const served = await w.fetch('http://d/api/keys');
+    eq(served.status, 200, '/api/keys now serves the commitment');
+    const body = await served.json();
+    eq(body.doc, commitment.doc, 'served byte-for-byte as uploaded');
+    eq(body.signature, commitment.signature, 'with the offline signature intact');
+  }
+  eq((await post('/admin/commitment', commitment)).status, 404,
+    'uploading a commitment without the admin key returns the decoy');
 
   // ── happy path ─────────────────────────────────────────────────────────
   section('issuance — the full real flow through workerd');
@@ -191,26 +228,36 @@ try {
   // Mint tokens locally under a chosen epoch's key. The server only ever issues
   // under the current one, so this is the only way to test acceptance of the
   // previous epoch and refusal of older ones without waiting a month.
-  const mintForEpoch = (epoch) => {
+  //
+  // The anchor spans neighbouring epochs, standing in for a client that
+  // anchored while each of them was current. The commitment the SERVER serves
+  // deliberately does not go backwards; this one is local to the test.
+  const wide = await mint({
+    master: voprfMaster, pkcs8: operator.pkcs8, serial: 1,
+    keys: Object.fromEntries([-2, -1, 0, 1].map((d) =>
+      [String(EPOCH + d), epochPublicKey(voprfMaster, EPOCH + d)])),
+  });
+  const mintForEpoch = async (epoch) => {
     const items = blind(2);
     const res = voprfIssue(deriveEpochKey(voprfMaster, epoch), items.map((i) => i.blinded));
-    return unblind(items, res.evaluated, res.proof, res.public_key);
+    return unblind(items, res.evaluated, res.proof, res.public_key,
+      anchorFor(epoch, wide, operator.pinnedKey));
   };
 
   {
-    const prev = mintForEpoch(EPOCH - 1)[0];
+    const prev = (await mintForEpoch(EPOCH - 1))[0];
     eq((await post('/api/credentials', { token: { t: prev.token, w: prev.witness, e: EPOCH - 1 }, device_pubkey: device.spki })).status,
       200, 'a token from the PREVIOUS epoch is still accepted — rotation is not a cliff');
 
-    const old = mintForEpoch(EPOCH - 2)[0];
+    const old = (await mintForEpoch(EPOCH - 2))[0];
     eq((await post('/api/credentials', { token: { t: old.token, w: old.witness, e: EPOCH - 2 }, device_pubkey: device.spki })).status,
       403, 'a token two epochs old is refused on its own terms, spend record or not');
 
-    const future = mintForEpoch(EPOCH + 1)[0];
+    const future = (await mintForEpoch(EPOCH + 1))[0];
     eq((await post('/api/credentials', { token: { t: future.token, w: future.witness, e: EPOCH + 1 }, device_pubkey: device.spki })).status,
       403, 'a token claiming a future epoch is refused');
 
-    const t = mintForEpoch(EPOCH)[0];
+    const t = (await mintForEpoch(EPOCH))[0];
     eq((await post('/api/credentials', { token: { t: t.token, w: t.witness, e: EPOCH - 1 }, device_pubkey: device.spki })).status,
       403, 'lying about which epoch a token came from fails verification');
     eq((await post('/api/credentials', { token: { t: t.token, w: t.witness }, device_pubkey: device.spki })).status,
@@ -283,11 +330,33 @@ try {
     })).status, 404, 'a replayed device signature outside the skew window is rejected');
   }
 
-  section('anti-tagging — the client must refuse a bad proof');
-  await throws(async () => {
-    const { raw, items } = await getTokens(device, 2).then((r) => r);
-    unblind(items, raw.evaluated, { e: raw.proof.e, s: '00'.repeat(32) }, raw.public_key);
-  }, 'unblind() throws on a tampered DLEQ proof from the live server');
+  section('anti-tagging against the live server');
+  {
+    const H = { 'cf-connecting-ip': '10.2.0.1' };   // its own rate-limit bucket
+    const items = blind(2);
+    const ch = await (await w.fetch('http://d/api/challenge', { headers: H })).json();
+    const res = await post('/api/issue', {
+      challenge: ch.challenge, nonce: solvePow(ch.challenge, ch.bits),
+      blinded: items.map((i) => i.blinded),
+      device_pubkey: device.spki, device_sig: await device.sign(ch.challenge),
+    }, H);
+    if (res.status !== 200) throw new Error(`setup issue failed: ${res.status}`);
+    const raw = await res.json();
+
+    await throws(() => unblind(items, raw.evaluated, { e: raw.proof.e, s: '00'.repeat(32) },
+      raw.public_key, anchor()), 'a tampered DLEQ proof from the live server is refused');
+
+    // The attack that matters: a valid proof under a key the operator never
+    // committed to. Simulated here because the real server is honest.
+    const rogue = voprfIssue(deriveEpochKey(generateMaster(), EPOCH), items.map((i) => i.blinded));
+    check(verifyBatch(rogue.public_key, items.map((i) => i.blinded), rogue.evaluated, rogue.proof),
+      'a per-user issuer key produces a VALID proof — the proof alone proves nothing');
+    await throws(() => unblind(items, rogue.evaluated, rogue.proof, rogue.public_key, anchor()),
+      'and the anchored client refuses it');
+
+    await throws(() => unblind(items, raw.evaluated, raw.proof, raw.public_key),
+      'unblind() with no anchor at all throws');
+  }
 
   section('2.8 — attribution survives concurrency');
   {
