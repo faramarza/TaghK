@@ -403,14 +403,19 @@ export function blind(count = 8) {
  * cannot be redeemed and losing them separately is an easy mistake to make.
  */
 export async function unblind(items, evaluatedHex, proof, publicKey, anchor) {
-  if (!anchor || typeof anchor !== 'object') {
+  // anchor = { epoch, served: { doc, signature }, trust: { pinnedKey, … } }
+  // The two halves are separate so server-supplied fields can never overwrite
+  // client-held ones — see anchorEpochKey().
+  if (!anchor || typeof anchor !== 'object' || !anchor.served || !anchor.trust) {
     throw new Error(
-      'refusing to unblind without an anchored issuer key. Pass the signed key ' +
-      'commitment; see commitment.js. There is no unanchored mode.'
+      'refusing to unblind without an anchored issuer key. Pass ' +
+      '{ epoch, served: { doc, signature }, trust: { pinnedKey } }; ' +
+      'see commitment.js. There is no unanchored mode.'
     );
   }
 
-  const { publicKey: committed, serial } = await anchorEpochKey(anchor.epoch, anchor);
+  const { publicKey: committed, serial } =
+    await anchorEpochKey(anchor.epoch, anchor.served, anchor.trust);
 
   if (typeof publicKey !== 'string' || !timingSafeEqual(fromHex(committed), fromHex(publicKey))) {
     throw new Error(

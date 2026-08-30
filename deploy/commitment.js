@@ -90,6 +90,17 @@
 const enc = new TextEncoder();
 
 export const COMMITMENT_VERSION = 1;
+
+/**
+ * Epoch length, duplicated from voprf.js rather than imported.
+ *
+ * commitment.js must stay importable by a client that does not pull in the
+ * group arithmetic, and a circular import between the two is worse than one
+ * constant in two places. The anchor test asserts they agree, so a change to
+ * one that is not mirrored fails the build rather than silently loosening this
+ * bound.
+ */
+export const EPOCH_SECONDS_FOR_BOUNDS = 30 * 86400;
 export const NULL_PREV = '0'.repeat(64);
 
 const toHex = (b) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, '0')).join('');
@@ -105,14 +116,28 @@ export async function commitmentHash(docString) {
  * Verify a commitment and return the public key committed for `epoch`.
  * Throws on every failure — there is no partial success worth having here.
  *
- * @param anchor.doc        the document string EXACTLY as received
- * @param anchor.signature  base64 Ed25519 signature over those bytes
- * @param anchor.pinnedKey  base64 raw Ed25519 public key, pinned in the build
- * @param anchor.minSerial  highest serial this client has ever accepted
- * @param anchor.now        milliseconds, injectable for tests
+ * THE TWO ARGUMENTS ARE SPLIT ALONG THE TRUST BOUNDARY, ON PURPOSE.
+ *
+ *   `served` is what came off the network. The server chose every byte of it.
+ *   `trust`  is what the client knows independently: the key pinned in its
+ *            build, the highest serial it has already accepted, and its clock.
+ *
+ * They are separate objects so that no future client can merge them. A single
+ * bag of options invites `{ ...serverResponse, pinnedKey }`, and the moment a
+ * server response gains a `minSerial` or `now` field — by accident or by
+ * design — that spread silently disables rollback protection and expiry
+ * checking while the code continues to look correct. Keeping the boundary in
+ * the signature makes the mistake unspellable rather than merely discouraged.
+ *
+ * @param served.doc        the document string EXACTLY as received
+ * @param served.signature  base64 Ed25519 signature over those bytes
+ * @param trust.pinnedKey   base64 raw Ed25519 public key, pinned in the build
+ * @param trust.minSerial   highest serial this client has ever accepted
+ * @param trust.now         milliseconds; the CLIENT's clock, never the server's
  */
-export async function anchorEpochKey(epoch, anchor) {
-  const { doc, signature, pinnedKey, minSerial = 0, now = Date.now() } = anchor ?? {};
+export async function anchorEpochKey(epoch, served, trust) {
+  const { doc, signature } = served ?? {};
+  const { pinnedKey, minSerial = 0, now = Date.now() } = trust ?? {};
 
   if (typeof doc !== 'string' || !doc.length) throw new Error('commitment: missing document');
   if (typeof signature !== 'string') throw new Error('commitment: missing signature');
@@ -157,6 +182,16 @@ export async function anchorEpochKey(epoch, anchor) {
 
   if (typeof parsed.prev !== 'string' || !/^[0-9a-f]{64}$/.test(parsed.prev)) {
     throw new Error('commitment: bad predecessor hash');
+  }
+
+  // The server names the epoch, so bound it against the client's own clock.
+  // Otherwise a server holding the master could issue every user a different
+  // epoch from within the commitment window, widening a two-way partition into
+  // an N-way one. N is small, but it costs nothing to refuse.
+  if (!Number.isSafeInteger(epoch)) throw new Error('commitment: bad epoch');
+  const localEpoch = Math.floor(now / 1000 / EPOCH_SECONDS_FOR_BOUNDS);
+  if (Math.abs(epoch - localEpoch) > 1) {
+    throw new Error(`commitment: epoch ${epoch} is not close to this client's own epoch ${localEpoch}`);
   }
 
   const committed = parsed.keys?.[String(epoch)];

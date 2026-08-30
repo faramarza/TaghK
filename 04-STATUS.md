@@ -439,7 +439,7 @@ honeypot.
 
 ### 3.7 Testing beyond the crypto
 
-Largely addressed. `deploy/test/` runs **260 checks across eight suites**:
+Largely addressed. `deploy/test/` runs **265 checks across eight suites**:
 
 | Suite | What it runs |
 |---|---|

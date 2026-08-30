@@ -70,6 +70,30 @@ This is the whole ADR. Two very different security claims turn on it:
 "Malicious server (us, compromised)" is a named adversary in 03-SECURITY.md §1.
 Until now nothing actually answered it.
 
+### The trust boundary is in the signature
+
+`anchorEpochKey(epoch, served, trust)` takes two objects, not one:
+
+- **`served`** — `{ doc, signature }`, the bytes off the network. The server
+  chose every one of them.
+- **`trust`** — `{ pinnedKey, minSerial, now }`, what the client knows
+  independently: its build-time key, the highest serial it has accepted, and
+  its own clock.
+
+They are separate arguments so no future client can merge them. A single bag of
+options invites `{ ...serverResponse, pinnedKey }`, and the moment a response
+gains a `minSerial` or `now` field — by accident or design — that spread
+silently disables rollback protection and expiry checking while the code
+continues to look correct. Keeping the boundary in the signature makes the
+mistake unspellable rather than merely discouraged. Tested directly: a hostile
+response carrying `minSerial`, `now` and `pinnedKey` has none of them read.
+
+The client also refuses an epoch more than one away from the epoch its own
+clock computes. The server names the epoch, and without that bound a server
+holding the master could place each user in a different epoch inside the
+commitment window, widening a two-way partition into an N-way one. N is small;
+refusing costs nothing.
+
 ### There is no unanchored mode
 
 `unblind()` requires the anchor and throws without one. A client built with no

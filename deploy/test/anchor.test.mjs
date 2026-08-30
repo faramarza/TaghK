@@ -17,7 +17,8 @@ import {
   blind, unblind, issue, verifyBatch, generateMaster, generateKey,
   currentEpoch, epochPublicKey, deriveEpochKey, EPOCH_LENGTH_S,
 } from '../voprf.js';
-import { buildCommitment, commitmentHash, anchorEpochKey, NULL_PREV } from '../commitment.js';
+import { buildCommitment, commitmentHash, anchorEpochKey, NULL_PREV,
+         EPOCH_SECONDS_FOR_BOUNDS } from '../commitment.js';
 import { commitmentKeypair, sign, mint, anchorFor } from './anchor-helper.mjs';
 
 const master = generateMaster();
@@ -92,24 +93,51 @@ await throws(async () => {
 
 section('commitment validation');
 
-const good = anchorFor(EPOCH, commitment, operator.pinnedKey);
+// Server-supplied bytes and client-held trust are separate arguments; these
+// helpers keep the test honest about which side each tampering happens on.
+const served = (over = {}) => ({ doc: commitment.doc, signature: commitment.signature, ...over });
+const trust = (over = {}) => ({ pinnedKey: operator.pinnedKey, minSerial: 0, ...over });
 
-await throws(() => anchorEpochKey(EPOCH, { ...good, doc: commitment.doc + ' ' }),
+await throws(() => anchorEpochKey(EPOCH, served({ doc: commitment.doc + ' ' }), trust()),
   'a modified document fails the signature');
-await throws(() => anchorEpochKey(EPOCH, { ...good, signature: 'AAAA' }),
+await throws(() => anchorEpochKey(EPOCH, served({ signature: 'AAAA' }), trust()),
   'a malformed signature is refused');
-await throws(() => anchorEpochKey(EPOCH + 5, good),
-  'an epoch with no committed key is refused');
-await throws(() => anchorEpochKey(EPOCH, { ...good, minSerial: 5 }),
+await throws(() => anchorEpochKey(EPOCH, served({ doc: '' }), trust()),
+  'an empty document is refused');
+await throws(() => anchorEpochKey(EPOCH + 5, served(), trust()),
+  'an epoch outside the client’s own clock is refused');
+await throws(() => anchorEpochKey(EPOCH, served(), trust({ minSerial: 5 })),
   'a serial older than one already seen is refused — no silent rollback');
-await throws(() => anchorEpochKey(EPOCH, { ...good, now: (EPOCH + 9) * EPOCH_LENGTH_S * 1000 }),
+await throws(() => anchorEpochKey(EPOCH, served(), trust({ now: (EPOCH + 9) * EPOCH_LENGTH_S * 1000 })),
   'an expired commitment is refused');
+await throws(() => anchorEpochKey(EPOCH, served(), trust({ pinnedKey: undefined })),
+  'a missing pinned key is refused rather than defaulted');
 
 {
-  const r = await anchorEpochKey(EPOCH, { ...good, minSerial: 4 });
+  const r = await anchorEpochKey(EPOCH, served(), trust({ minSerial: 4 }));
   eq(r.publicKey, epochPublicKey(master, EPOCH), 'the committed key is the derived epoch key');
   eq(r.serial, 4, 'the serial is returned so the client can raise its floor');
 }
+
+section('the trust boundary cannot be collapsed');
+
+{
+  // The failure this shape exists to prevent: a client that merges the server
+  // response into its own options. If both halves shared one object, a response
+  // carrying `minSerial` or `now` would silently disable rollback protection
+  // and expiry. Here the server's fields land in `served` and are ignored.
+  const hostileResponse = {
+    doc: commitment.doc, signature: commitment.signature,
+    minSerial: 0, now: (EPOCH + 9) * EPOCH_LENGTH_S * 1000, pinnedKey: 'AAAA',
+  };
+  await throws(() => anchorEpochKey(EPOCH, hostileResponse, trust({ minSerial: 5 })),
+    'server-supplied minSerial cannot lower the client’s rollback floor');
+  const r = await anchorEpochKey(EPOCH, hostileResponse, trust());
+  eq(r.serial, 4, 'and server-supplied now/pinnedKey are simply not read');
+}
+
+eq(EPOCH_SECONDS_FOR_BOUNDS, EPOCH_LENGTH_S,
+  'commitment.js and voprf.js agree on the epoch length');
 
 section('the published history is a chain');
 
@@ -120,9 +148,10 @@ section('the published history is a chain');
     'each document names the hash of its predecessor');
   check(parsed.serial > JSON.parse(commitment.doc).serial, 'serials increase');
 
-  const r = await anchorEpochKey(EPOCH, anchorFor(EPOCH, next, operator.pinnedKey, 4));
+  const r = await anchorEpochKey(EPOCH, { doc: next.doc, signature: next.signature },
+    trust({ minSerial: 4 }));
   eq(r.serial, 5, 'a newer commitment is accepted over the floor');
-  await throws(() => anchorEpochKey(EPOCH, anchorFor(EPOCH, commitment, operator.pinnedKey, 5)),
+  await throws(() => anchorEpochKey(EPOCH, served(), trust({ minSerial: 5 })),
     'and the older one is then refused — equivocation cannot be a quiet downgrade');
 }
 

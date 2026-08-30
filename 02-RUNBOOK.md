@@ -59,7 +59,7 @@ and it is the difference between "syntax-valid" and "works".
 
 ```bash
 cd deploy && npm install
-./test/run-all.sh          # 260 checks; PYTHON=<venv>/bin/python if your
+./test/run-all.sh          # 265 checks; PYTHON=<venv>/bin/python if your
                            # system python lacks `cryptography`.
                            # Suites 6 and 7 need nginx and are SKIPPED loudly
                            # without it: apt-get install -y nginx-light

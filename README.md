@@ -45,7 +45,7 @@ Everything here serves those three.
 | `deploy/durable.js` | Strongly consistent primitives. Token spend records, single-use proof-of-work, probe nonces, rate limiters. These cannot live in KV — see `docs/adr/0001`. |
 | `deploy/canary.js`, `deploy/canary-pool.js` | Canary selection and the generated 246-host bootstrap pool. |
 | `deploy/selftest.mjs` | Cryptographic self-test. **Run before every deployment.** |
-| `deploy/test/` | 260 checks across eight suites. Both Workers driven through their real APIs in the real Workers runtime; the node's generated configs parsed and served; and the burn → attribution → replacement → self-heal loop run end to end with real processes. |
+| `deploy/test/` | 265 checks across eight suites. Both Workers driven through their real APIs in the real Workers runtime; the node's generated configs parsed and served; and the burn → attribution → replacement → self-heal loop run end to end with real processes. |
 | `docs/adr/` | Architecture decision records, including the escalated Cloudflare terms-of-service question. |
 | `deploy/wrangler*.toml`, `package.json` | Deployment config and key generation scripts. |
 

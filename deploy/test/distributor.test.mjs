@@ -23,7 +23,8 @@ import { createHash, webcrypto } from 'node:crypto';
 import { rmSync, readFileSync } from 'node:fs';
 import { section, check, eq, throws, summary } from './harness.mjs';
 import { blind, unblind, verifyBatch, issue as voprfIssue,
-         generateMaster, currentEpoch, deriveEpochKey, epochPublicKey } from '../voprf.js';
+         generateMaster, currentEpoch, deriveEpochKey, epochPublicKey,
+         EPOCH_LENGTH_S } from '../voprf.js';
 import { commitmentKeypair, mint, anchorFor } from './anchor-helper.mjs';
 
 const ADMIN_KEY = 'a1'.repeat(32);
@@ -232,16 +233,22 @@ try {
   // The anchor spans neighbouring epochs, standing in for a client that
   // anchored while each of them was current. The commitment the SERVER serves
   // deliberately does not go backwards; this one is local to the test.
-  const wide = await mint({
-    master: voprfMaster, pkcs8: operator.pkcs8, serial: 1,
-    keys: Object.fromEntries([-2, -1, 0, 1].map((d) =>
-      [String(EPOCH + d), epochPublicKey(voprfMaster, EPOCH + d)])),
-  });
+  // Each is anchored as a client of THAT epoch would have been: a commitment
+  // issued while the epoch was current, verified against that client's clock.
+  // The anchor deliberately refuses an epoch far from the verifier's own time,
+  // so a token from two epochs ago cannot be minted with today's document.
   const mintForEpoch = async (epoch) => {
+    const at = epoch * EPOCH_LENGTH_S;                  // that epoch's start
+    const doc = await mint({
+      master: voprfMaster, pkcs8: operator.pkcs8, serial: 1,
+      keys: Object.fromEntries([0, 1].map((d) =>
+        [String(epoch + d), epochPublicKey(voprfMaster, epoch + d)])),
+      issuedAt: at, notAfter: (epoch + 2) * EPOCH_LENGTH_S,
+    });
     const items = blind(2);
     const res = voprfIssue(deriveEpochKey(voprfMaster, epoch), items.map((i) => i.blinded));
     return unblind(items, res.evaluated, res.proof, res.public_key,
-      anchorFor(epoch, wide, operator.pinnedKey));
+      anchorFor(epoch, doc, operator.pinnedKey, 0, (at + 3600) * 1000));
   };
 
   {

@@ -67,10 +67,13 @@ if (cmd === 'enrol') {
   const keys = await (await fetch(`${base}/api/keys`)).json();
   const tokens = await unblind(items, out.evaluated, out.proof, out.public_key, {
     epoch: out.epoch,
-    doc: keys.doc,
-    signature: keys.signature,
-    pinnedKey: PINNED_COMMITMENT_KEY,
-    minSerial: Number(process.env.MIN_COMMITMENT_SERIAL || 0),
+    // What the server sent. Untrusted, kept separate on purpose.
+    served: { doc: keys.doc, signature: keys.signature },
+    // What this client knows independently. A server field can never land here.
+    trust: {
+      pinnedKey: PINNED_COMMITMENT_KEY,
+      minSerial: Number(process.env.MIN_COMMITMENT_SERIAL || 0),
+    },
   });
 
   const cred = await post('/api/credentials', {

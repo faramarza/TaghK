@@ -24,7 +24,8 @@ export async function sign(doc, pkcs8) {
 }
 
 /** A commitment covering `span` epochs from the current one. */
-export async function mint({ master, pkcs8, span = 3, serial = 0, prevDoc = null, keys = null }) {
+export async function mint({ master, pkcs8, span = 3, serial = 0, prevDoc = null, keys = null,
+                             issuedAt = null, notAfter = null }) {
   const start = currentEpoch();
   const committed = keys ?? Object.fromEntries(
     Array.from({ length: span }, (_, i) => [String(start + i), epochPublicKey(master, start + i)]));
@@ -32,12 +33,20 @@ export async function mint({ master, pkcs8, span = 3, serial = 0, prevDoc = null
     serial,
     prev: prevDoc ? await commitmentHash(prevDoc) : NULL_PREV,
     keys: committed,
-    issuedAt: Math.floor(Date.now() / 1000),
-    notAfter: (start + span) * EPOCH_LENGTH_S,
+    // Overridable so a test can model a client that anchored while an older
+    // epoch was current, rather than one time-travelling with today's document.
+    issuedAt: issuedAt ?? Math.floor(Date.now() / 1000),
+    notAfter: notAfter ?? (start + span) * EPOCH_LENGTH_S,
   });
   return { doc, signature: await sign(doc, pkcs8) };
 }
 
-/** The anchor object a client passes to unblind(). */
-export const anchorFor = (epoch, commitment, pinnedKey, minSerial = 0) =>
-  ({ epoch, doc: commitment.doc, signature: commitment.signature, pinnedKey, minSerial });
+/**
+ * The anchor a client passes to unblind(). Note the shape: what the server sent
+ * and what the client knows are kept apart so they cannot be merged.
+ */
+export const anchorFor = (epoch, commitment, pinnedKey, minSerial = 0, now = undefined) => ({
+  epoch,
+  served: { doc: commitment.doc, signature: commitment.signature },
+  trust: { pinnedKey, minSerial, ...(now === undefined ? {} : { now }) },
+});
